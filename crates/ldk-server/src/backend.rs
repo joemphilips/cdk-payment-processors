@@ -18,9 +18,12 @@ use cdk_common::util::{hex, unix_time};
 use cdk_common::QuoteId;
 use futures::Stream;
 use ldk_server_client::client::{EventStream, LdkServerClient};
+use ldk_server_client::error::LdkServerError;
 use ldk_server_client::ldk_server_grpc::api::{
-    Bolt11ReceiveRequest, Bolt11SendRequest, Bolt12ReceiveRequest, Bolt12SendRequest,
-    GetNodeInfoRequest, GetPaymentDetailsRequest, ListPaymentsRequest,
+    Bolt11ReceiveRequest, Bolt11ReceiveResponse, Bolt11SendRequest, Bolt11SendResponse,
+    Bolt12ReceiveRequest, Bolt12ReceiveResponse, Bolt12SendRequest, Bolt12SendResponse,
+    GetNodeInfoRequest, GetNodeInfoResponse, GetPaymentDetailsRequest, GetPaymentDetailsResponse,
+    ListPaymentsRequest, ListPaymentsResponse,
 };
 use ldk_server_client::ldk_server_grpc::events::{event_envelope, EventEnvelope};
 use ldk_server_client::ldk_server_grpc::types::{
@@ -104,6 +107,106 @@ impl OutgoingPaymentCorrelator {
 
 type OutgoingPaymentCorrelations = OutgoingPaymentCorrelator;
 
+/// The LDK Server calls that the backend makes.
+///
+/// [`LdkServerClient`] implements it. A test can supply a fake server.
+#[async_trait]
+pub trait LdkServerApi: Send + Sync {
+    /// See [`LdkServerClient::get_node_info`].
+    async fn get_node_info(
+        &self,
+        request: GetNodeInfoRequest,
+    ) -> Result<GetNodeInfoResponse, LdkServerError>;
+    /// See [`LdkServerClient::bolt11_receive`].
+    async fn bolt11_receive(
+        &self,
+        request: Bolt11ReceiveRequest,
+    ) -> Result<Bolt11ReceiveResponse, LdkServerError>;
+    /// See [`LdkServerClient::bolt12_receive`].
+    async fn bolt12_receive(
+        &self,
+        request: Bolt12ReceiveRequest,
+    ) -> Result<Bolt12ReceiveResponse, LdkServerError>;
+    /// See [`LdkServerClient::bolt11_send`].
+    async fn bolt11_send(
+        &self,
+        request: Bolt11SendRequest,
+    ) -> Result<Bolt11SendResponse, LdkServerError>;
+    /// See [`LdkServerClient::bolt12_send`].
+    async fn bolt12_send(
+        &self,
+        request: Bolt12SendRequest,
+    ) -> Result<Bolt12SendResponse, LdkServerError>;
+    /// See [`LdkServerClient::get_payment_details`].
+    async fn get_payment_details(
+        &self,
+        request: GetPaymentDetailsRequest,
+    ) -> Result<GetPaymentDetailsResponse, LdkServerError>;
+    /// See [`LdkServerClient::list_payments`].
+    async fn list_payments(
+        &self,
+        request: ListPaymentsRequest,
+    ) -> Result<ListPaymentsResponse, LdkServerError>;
+    /// See [`LdkServerClient::subscribe_events`].
+    async fn subscribe_events(&self) -> Result<EventStream, LdkServerError>;
+}
+
+#[async_trait]
+impl LdkServerApi for LdkServerClient {
+    async fn get_node_info(
+        &self,
+        request: GetNodeInfoRequest,
+    ) -> Result<GetNodeInfoResponse, LdkServerError> {
+        LdkServerClient::get_node_info(self, request).await
+    }
+
+    async fn bolt11_receive(
+        &self,
+        request: Bolt11ReceiveRequest,
+    ) -> Result<Bolt11ReceiveResponse, LdkServerError> {
+        LdkServerClient::bolt11_receive(self, request).await
+    }
+
+    async fn bolt12_receive(
+        &self,
+        request: Bolt12ReceiveRequest,
+    ) -> Result<Bolt12ReceiveResponse, LdkServerError> {
+        LdkServerClient::bolt12_receive(self, request).await
+    }
+
+    async fn bolt11_send(
+        &self,
+        request: Bolt11SendRequest,
+    ) -> Result<Bolt11SendResponse, LdkServerError> {
+        LdkServerClient::bolt11_send(self, request).await
+    }
+
+    async fn bolt12_send(
+        &self,
+        request: Bolt12SendRequest,
+    ) -> Result<Bolt12SendResponse, LdkServerError> {
+        LdkServerClient::bolt12_send(self, request).await
+    }
+
+    async fn get_payment_details(
+        &self,
+        request: GetPaymentDetailsRequest,
+    ) -> Result<GetPaymentDetailsResponse, LdkServerError> {
+        LdkServerClient::get_payment_details(self, request).await
+    }
+
+    async fn list_payments(
+        &self,
+        request: ListPaymentsRequest,
+    ) -> Result<ListPaymentsResponse, LdkServerError> {
+        LdkServerClient::list_payments(self, request).await
+    }
+
+    async fn subscribe_events(&self) -> Result<EventStream, LdkServerError> {
+        LdkServerClient::subscribe_events(self).await
+    }
+}
+
 /// LDK Server backend configuration.
 #[derive(Clone)]
 pub struct Config {
@@ -170,7 +273,7 @@ impl Config {
 /// LDK Server payment backend.
 #[derive(Clone)]
 pub struct LdkServerBackend {
-    client: LdkServerClient,
+    client: Arc<dyn LdkServerApi>,
     fee_reserve: FeeReserve,
     wait_invoice_cancel_token: CancellationToken,
     wait_invoice_is_active: Arc<AtomicBool>,
@@ -224,15 +327,29 @@ impl LdkServerBackend {
         let client = LdkServerClient::new(address, config.macaroon, &config.cert_pem)
             .map_err(Error::Client)?;
 
-        Ok(Self {
+        Ok(Self::with_api(
+            Arc::new(client),
+            config.fee_reserve,
+            config.max_payment_scan_pages,
+            config.advertised_methods,
+        ))
+    }
+
+    fn with_api(
+        client: Arc<dyn LdkServerApi>,
+        fee_reserve: FeeReserve,
+        max_payment_scan_pages: u16,
+        advertised_methods: Vec<AdvertisedMethod>,
+    ) -> Self {
+        Self {
             client,
-            fee_reserve: config.fee_reserve,
+            fee_reserve,
             wait_invoice_cancel_token: CancellationToken::new(),
             wait_invoice_is_active: Arc::new(AtomicBool::new(false)),
             outgoing_payment_correlations: OutgoingPaymentCorrelator::new(),
-            max_payment_scan_pages: config.max_payment_scan_pages,
-            advertised_methods: config.advertised_methods,
-        })
+            max_payment_scan_pages,
+            advertised_methods,
+        }
     }
 
     async fn get_payment_details(&self, payment_id: &str) -> Result<Option<Payment>, Error> {
@@ -923,7 +1040,7 @@ impl Drop for LdkServerBackend {
 }
 
 struct EventStreamState {
-    client: LdkServerClient,
+    client: Arc<dyn LdkServerApi>,
     cancel_token: CancellationToken,
     is_active: Arc<AtomicBool>,
     outgoing_payment_correlations: OutgoingPaymentCorrelations,
