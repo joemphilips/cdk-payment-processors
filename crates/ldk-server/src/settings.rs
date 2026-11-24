@@ -174,7 +174,7 @@ fn default_fee_reserve_percent() -> f32 {
 }
 
 fn default_max_payment_scan_pages() -> u16 {
-    32
+    crate::backend::DEFAULT_MAX_PAYMENT_SCAN_PAGES
 }
 
 /// Main configuration: config.toml overlaid by environment variables.

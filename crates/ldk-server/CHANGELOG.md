@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LDK payment ID.
 - An outgoing status check by payment hash reads the BOLT11 send directly
   before it scans the payment history.
+- An incoming status check by payment hash ends at the newest match. A scan
+  that reaches `ldk.max_payment_scan_pages` returns the matches that it found
+  and fails only when it found none. Before, a node with more than 1,600
+  payments failed every incoming status check, so a deposit that the event
+  stream missed was not credited. The default cap is now 200 pages (10,000
+  payments).
 - Fixed intermittent `Payment not found` failures in the direct BOLT11 send and
   gRPC melt regtest scenarios by waiting for payment history to catch up with
   live payment status before asserting hash-based results.

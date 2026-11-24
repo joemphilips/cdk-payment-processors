@@ -41,8 +41,8 @@ const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 36_000;
 const DEFAULT_PAYMENT_WAIT_SECS: u64 = 10;
 const OUTGOING_CONTEXT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const UNMATCHED_OUTGOING_EVENT_TTL: Duration = Duration::from_secs(60);
-#[allow(dead_code)]
-const DEFAULT_MAX_PAYMENT_SCAN_PAGES: u16 = 32;
+/// 200 pages of 50 payments: a scan reads at most 10,000 payments.
+pub(crate) const DEFAULT_MAX_PAYMENT_SCAN_PAGES: u16 = 200;
 const ROUTE_DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA: u32 = 1008;
 const ROUTE_DEFAULT_MAX_PATH_COUNT: u32 = 10;
 const ROUTE_DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF: u32 = 2;
@@ -363,7 +363,16 @@ impl LdkServerBackend {
         Ok(response.payment)
     }
 
-    async fn list_matching_payments<F>(&self, mut matches_payment: F) -> Result<Vec<Payment>, Error>
+    /// Scans the payment history, newest first, for matching payments.
+    ///
+    /// With `first_only`, the scan ends at the first match. A scan that reaches
+    /// `max_payment_scan_pages` returns the matches that it found. It fails
+    /// only when it found none, because then an older page can hold a match.
+    async fn list_matching_payments<F>(
+        &self,
+        mut matches_payment: F,
+        first_only: bool,
+    ) -> Result<Vec<Payment>, Error>
     where
         F: FnMut(&Payment) -> bool,
     {
@@ -376,7 +385,14 @@ impl LdkServerBackend {
                 .list_payments(ListPaymentsRequest { page_token })
                 .await?;
 
-            payments.extend(response.payments.into_iter().filter(|p| matches_payment(p)));
+            for payment in response.payments {
+                if matches_payment(&payment) {
+                    payments.push(payment);
+                    if first_only {
+                        return Ok(payments);
+                    }
+                }
+            }
 
             match response.next_page_token {
                 Some(next_page_token) => page_token = Some(next_page_token),
@@ -384,9 +400,17 @@ impl LdkServerBackend {
             }
         }
 
-        Err(Error::PaymentScanLimitExceeded {
-            max_pages: self.max_payment_scan_pages,
-        })
+        if payments.is_empty() {
+            return Err(Error::PaymentScanLimitExceeded {
+                max_pages: self.max_payment_scan_pages,
+            });
+        }
+        tracing::warn!(
+            "Payment scan stopped after {} pages with {} matches; older pages were not read",
+            self.max_payment_scan_pages,
+            payments.len()
+        );
+        Ok(payments)
     }
 
     async fn wait_for_payment_details(
@@ -895,15 +919,18 @@ impl MintPayment for LdkServerBackend {
         match payment_identifier {
             PaymentIdentifier::OfferId(offer_id) => {
                 let payments = self
-                    .list_matching_payments(|payment| {
-                        matches!(payment_direction(payment), Ok(PaymentDirection::Inbound))
-                            && matches!(payment_status(payment), Ok(PaymentStatus::Succeeded))
-                            && matches!(
-                                payment_kind(payment),
-                                Ok(payment_kind::Kind::Bolt12Offer(bolt12))
-                                    if bolt12.offer_id == *offer_id
-                            )
-                    })
+                    .list_matching_payments(
+                        |payment| {
+                            matches!(payment_direction(payment), Ok(PaymentDirection::Inbound))
+                                && matches!(payment_status(payment), Ok(PaymentStatus::Succeeded))
+                                && matches!(
+                                    payment_kind(payment),
+                                    Ok(payment_kind::Kind::Bolt12Offer(bolt12))
+                                        if bolt12.offer_id == *offer_id
+                                )
+                        },
+                        false,
+                    )
                     .await?;
 
                 Ok(payments
@@ -925,15 +952,18 @@ impl MintPayment for LdkServerBackend {
             PaymentIdentifier::PaymentHash(hash) => {
                 let hash = hex::encode(hash);
                 let payments = self
-                    .list_matching_payments(|payment| {
-                        matches!(payment_direction(payment), Ok(PaymentDirection::Inbound))
-                            && matches!(payment_status(payment), Ok(PaymentStatus::Succeeded))
-                            && matches!(
-                                payment_kind(payment),
-                                Ok(payment_kind::Kind::Bolt11(bolt11))
-                                    if bolt11.hash.eq_ignore_ascii_case(&hash)
-                            )
-                    })
+                    .list_matching_payments(
+                        |payment| {
+                            matches!(payment_direction(payment), Ok(PaymentDirection::Inbound))
+                                && matches!(payment_status(payment), Ok(PaymentStatus::Succeeded))
+                                && matches!(
+                                    payment_kind(payment),
+                                    Ok(payment_kind::Kind::Bolt11(bolt11))
+                                        if bolt11.hash.eq_ignore_ascii_case(&hash)
+                                )
+                        },
+                        true,
+                    )
                     .await?;
 
                 Ok(payments
@@ -1004,7 +1034,7 @@ impl MintPayment for LdkServerBackend {
                 let payment = match self.get_payment_details(&hash).await? {
                     Some(payment) if is_bolt11_send(&payment) => payment,
                     _ => {
-                        let payments = self.list_matching_payments(is_bolt11_send).await?;
+                        let payments = self.list_matching_payments(is_bolt11_send, false).await?;
                         select_bolt11_payment(payments).ok_or(Error::PaymentNotFound)?
                     }
                 };
@@ -1971,5 +2001,282 @@ mod tests {
             payment_status(&selected).expect("valid status"),
             PaymentStatus::Succeeded
         );
+    }
+}
+
+/// Tests that drive the backend against an in-memory LDK Server.
+#[cfg(test)]
+mod fake_server_tests {
+    use ldk_server_client::error::LdkServerErrorCode;
+    use ldk_server_client::ldk_server_grpc::types::{Bolt11, Bolt12Offer, PaymentKind};
+
+    use super::*;
+
+    /// LDK Node lists 50 payments on each page.
+    const PAGE_SIZE: usize = 50;
+
+    #[derive(Default)]
+    struct FakeState {
+        /// Newest first, as LDK Node lists them.
+        payments: Vec<Payment>,
+        list_calls: usize,
+    }
+
+    #[derive(Default)]
+    struct FakeLdkServer {
+        state: std::sync::Mutex<FakeState>,
+    }
+
+    impl FakeLdkServer {
+        fn with_payments(payments: Vec<Payment>) -> Arc<Self> {
+            let server = Self::default();
+            server.state.lock().unwrap().payments = payments;
+            Arc::new(server)
+        }
+
+        fn list_calls(&self) -> usize {
+            self.state.lock().unwrap().list_calls
+        }
+    }
+
+    fn unsupported<T>() -> Result<T, LdkServerError> {
+        Err(LdkServerError::new(
+            LdkServerErrorCode::InternalError,
+            "not supported by the fake LDK Server",
+        ))
+    }
+
+    #[async_trait]
+    impl LdkServerApi for FakeLdkServer {
+        async fn get_node_info(
+            &self,
+            _request: GetNodeInfoRequest,
+        ) -> Result<GetNodeInfoResponse, LdkServerError> {
+            unsupported()
+        }
+
+        async fn bolt11_receive(
+            &self,
+            _request: Bolt11ReceiveRequest,
+        ) -> Result<Bolt11ReceiveResponse, LdkServerError> {
+            unsupported()
+        }
+
+        async fn bolt12_receive(
+            &self,
+            _request: Bolt12ReceiveRequest,
+        ) -> Result<Bolt12ReceiveResponse, LdkServerError> {
+            unsupported()
+        }
+
+        async fn bolt11_send(
+            &self,
+            _request: Bolt11SendRequest,
+        ) -> Result<Bolt11SendResponse, LdkServerError> {
+            unsupported()
+        }
+
+        async fn bolt12_send(
+            &self,
+            _request: Bolt12SendRequest,
+        ) -> Result<Bolt12SendResponse, LdkServerError> {
+            unsupported()
+        }
+
+        async fn get_payment_details(
+            &self,
+            request: GetPaymentDetailsRequest,
+        ) -> Result<GetPaymentDetailsResponse, LdkServerError> {
+            let state = self.state.lock().unwrap();
+            let payment = state
+                .payments
+                .iter()
+                .find(|payment| payment.payment_id == request.payment_id)
+                .cloned();
+            Ok(GetPaymentDetailsResponse { payment })
+        }
+
+        async fn list_payments(
+            &self,
+            request: ListPaymentsRequest,
+        ) -> Result<ListPaymentsResponse, LdkServerError> {
+            let mut state = self.state.lock().unwrap();
+            state.list_calls += 1;
+            let start: usize = request
+                .page_token
+                .map(|token| token.parse().expect("fake page token"))
+                .unwrap_or(0);
+            let end = (start + PAGE_SIZE).min(state.payments.len());
+            Ok(ListPaymentsResponse {
+                payments: state.payments[start..end].to_vec(),
+                next_page_token: (end < state.payments.len()).then(|| end.to_string()),
+            })
+        }
+
+        async fn subscribe_events(&self) -> Result<EventStream, LdkServerError> {
+            unsupported()
+        }
+    }
+
+    fn backend(server: Arc<FakeLdkServer>, max_payment_scan_pages: u16) -> LdkServerBackend {
+        LdkServerBackend::with_api(
+            server,
+            FeeReserve {
+                min_fee_reserve: Amount::from(2_u64),
+                percent_fee_reserve: 0.01,
+            },
+            max_payment_scan_pages,
+            AdvertisedMethod::ALL.to_vec(),
+        )
+    }
+
+    fn hash_hex(index: u32) -> String {
+        format!("{index:064x}")
+    }
+
+    fn bolt11_payment(
+        payment_id: String,
+        hash: String,
+        direction: PaymentDirection,
+        status: PaymentStatus,
+        latest_update_timestamp: u64,
+    ) -> Payment {
+        Payment {
+            payment_id,
+            kind: Some(PaymentKind {
+                kind: Some(payment_kind::Kind::Bolt11(Bolt11 {
+                    hash,
+                    preimage: (status == PaymentStatus::Succeeded).then(|| "03".repeat(32)),
+                    secret: None,
+                    counterparty_skimmed_fee_msat: None,
+                })),
+            }),
+            amount_msat: Some(1_000_000),
+            fee_paid_msat: Some(0),
+            direction: direction as i32,
+            status: status as i32,
+            latest_update_timestamp,
+        }
+    }
+
+    /// Received BOLT11 payments that match no lookup. Their payment IDs are not
+    /// their hashes, as for LDK Node receives.
+    fn other_receives(count: u32) -> Vec<Payment> {
+        (1..=count)
+            .map(|index| {
+                bolt11_payment(
+                    hash_hex(1_000_000 + index),
+                    hash_hex(index),
+                    PaymentDirection::Inbound,
+                    PaymentStatus::Succeeded,
+                    10,
+                )
+            })
+            .collect()
+    }
+
+    fn bolt12_receive(offer_id: &str, index: u32) -> Payment {
+        Payment {
+            payment_id: hash_hex(2_000_000 + index),
+            kind: Some(PaymentKind {
+                kind: Some(payment_kind::Kind::Bolt12Offer(Bolt12Offer {
+                    hash: Some(hash_hex(3_000_000 + index)),
+                    preimage: Some("03".repeat(32)),
+                    secret: None,
+                    offer_id: offer_id.to_string(),
+                    payer_note: None,
+                    quantity: None,
+                })),
+            }),
+            amount_msat: Some(1_000_000),
+            fee_paid_msat: None,
+            direction: PaymentDirection::Inbound as i32,
+            status: PaymentStatus::Succeeded as i32,
+            latest_update_timestamp: 10,
+        }
+    }
+
+    fn hash_bytes(hash: &str) -> [u8; 32] {
+        hex::decode(hash).unwrap().try_into().unwrap()
+    }
+
+    // ------------------------------------------------ incoming status scans
+
+    #[tokio::test]
+    async fn an_incoming_hash_check_stops_at_the_newest_match() {
+        let target = hash_hex(4_000_000);
+        let mut history = vec![bolt11_payment(
+            hash_hex(5_000_000),
+            target.clone(),
+            PaymentDirection::Inbound,
+            PaymentStatus::Succeeded,
+            20,
+        )];
+        // More than 32 pages of older payments.
+        history.extend(other_receives(1_700));
+        let server = FakeLdkServer::with_payments(history);
+
+        let found = backend(server.clone(), 32)
+            .check_incoming_payment_status(&PaymentIdentifier::PaymentHash(hash_bytes(&target)))
+            .await
+            .expect("a match on the first page must not hit the scan cap");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].payment_identifier,
+            PaymentIdentifier::PaymentHash(hash_bytes(&target))
+        );
+        assert_eq!(server.list_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_incoming_offer_check_keeps_the_matches_found_before_the_cap() {
+        let mut history = vec![bolt12_receive("offer-a", 1)];
+        history.extend(other_receives(1_700));
+        let server = FakeLdkServer::with_payments(history);
+
+        let found = backend(server, 32)
+            .check_incoming_payment_status(&PaymentIdentifier::OfferId("offer-a".to_string()))
+            .await
+            .expect("a found offer payment must not be lost at the scan cap");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].payment_identifier,
+            PaymentIdentifier::OfferId("offer-a".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_incoming_check_without_a_match_fails_at_the_cap() {
+        let server = FakeLdkServer::with_payments(other_receives(1_700));
+
+        let error = backend(server, 32)
+            .check_incoming_payment_status(&PaymentIdentifier::PaymentHash([0xee; 32]))
+            .await
+            .expect_err("a check that saw no match must not report an empty result");
+
+        assert!(error.to_string().contains("scan limit"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_default_cap_reaches_a_receive_behind_three_thousand_payments() {
+        let target = hash_hex(4_000_001);
+        let mut history = other_receives(3_000);
+        history.push(bolt11_payment(
+            hash_hex(5_000_001),
+            target.clone(),
+            PaymentDirection::Inbound,
+            PaymentStatus::Succeeded,
+            5,
+        ));
+        let server = FakeLdkServer::with_payments(history);
+
+        let found = backend(server, DEFAULT_MAX_PAYMENT_SCAN_PAGES)
+            .check_incoming_payment_status(&PaymentIdentifier::PaymentHash(hash_bytes(&target)))
+            .await
+            .expect("the default cap must cover a long payment history");
+
+        assert_eq!(found.len(), 1);
     }
 }

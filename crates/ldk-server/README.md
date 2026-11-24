@@ -66,7 +66,7 @@ values.
 | `ldk.tls_cert_path` | `LDK_TLS_CERT_PATH` | Required |
 | `ldk.fee_reserve_min_sat` | `LDK_FEE_RESERVE_MIN_SAT` | `2` |
 | `ldk.fee_reserve_percent` | `LDK_FEE_RESERVE_PERCENT` | `0.01` |
-| `ldk.max_payment_scan_pages` | `LDK_MAX_PAYMENT_SCAN_PAGES` | `32` |
+| `ldk.max_payment_scan_pages` | `LDK_MAX_PAYMENT_SCAN_PAGES` | `200` |
 | `ldk.payment_methods` | `LDK_PAYMENT_METHODS` | all supported |
 
 Boolean environment variables accept only the literal values `true` and
