@@ -47,6 +47,11 @@ cdk-sqlite = { version = "0.18.2", default-features = false, features = ["mint",
 corepc-node = { version = "0.10", features = ["download", "29_0"], optional = true }
 lightning-invoice = { version = "0.34", optional = true }
 
+# A panic ends the process, so that it restarts with every task (src/main.rs
+# refuses a release build with another strategy).
+[profile.release]
+panic = "abort"
+
 [[test]]
 name = "regtest"
 path = "tests/regtest.rs"
@@ -65,3 +70,6 @@ cdk-payment-processor = { git = "https://github.com/joemphilips/cdk", rev = "fee
 cdk-signatory = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
 cdk-sql-common = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
 cdk-sqlite = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
+# The SQLite WAL correction of that fork (RUSTSEC-2026-0459). Only the test
+# builds (`regtest-tests`) link SQLite.
+libsqlite3-sys = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }

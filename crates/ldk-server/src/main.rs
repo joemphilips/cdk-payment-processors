@@ -19,6 +19,14 @@ use tokio::signal;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing_subscriber::EnvFilter;
 
+// A panic must end the process. With the default strategy, a panic ends only its task, and the
+// processor then runs on without that task, for example without its event task. Each BOLT11 send
+// has its mark before its dispatch, so a restart is safe. `[profile.release]` sets the strategy.
+// This check refuses a release build with another one, also when an environment variable changed
+// the profile.
+#[cfg(all(not(test), not(debug_assertions), not(panic = "abort")))]
+compile_error!("a release build of the processor needs panic = \"abort\"");
+
 const INSECURE_GUIDANCE: &str = "configure mTLS with tls_enable = true and \
     tls_cert_path/tls_key_path/tls_client_ca_path, or set allow_insecure = true to accept \
     cleartext traffic";

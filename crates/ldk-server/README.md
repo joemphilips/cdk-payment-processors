@@ -59,6 +59,9 @@ held its mark.
   `--init-state` and `--clear-mark` refuse while it runs, and a second
   processor with the same state file does not start. Do not delete the lock
   file while a processor runs.
+- A panic ends the processor (the release build has `panic = "abort"`, and a
+  build without it fails). Each BOLT11 send has its mark in the file before its
+  dispatch, so restart the processor after it, as after each other crash.
 - Run one processor for one LDK Server node. A second processor has its own
   marks, so after a double fault it can report a stale Failed record.
 

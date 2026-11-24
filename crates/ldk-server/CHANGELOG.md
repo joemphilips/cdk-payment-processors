@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serialized configuration no longer contain the macaroon.
 - bitCaster fork only: a `[patch.crates-io]` section builds the crate against
   the bitCaster CDK fork `fee0f9d4`. Remove it before an upstream pull request.
+  It also replaces `libsqlite3-sys`, which only the test builds link, with the
+  copy that has the SQLite WAL correction.
+- The release build has `panic = "abort"`. A panic ends the process, so that no
+  processor runs on without one of its tasks. A release build with another
+  panic strategy fails.
 
 ### Fixed
 
