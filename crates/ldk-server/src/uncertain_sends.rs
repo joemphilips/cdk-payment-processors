@@ -83,8 +83,32 @@ impl UncertainSends {
         Ok(sends)
     }
 
-    /// Marks a send and writes the state file before the caller reports the
-    /// failed send.
+    /// Marks a send before its dispatch and writes the state file.
+    ///
+    /// Returns false and keeps the mark when the hash already has one: an
+    /// earlier send can still be in flight, and its baseline is older.
+    pub(crate) fn begin_send(
+        &mut self,
+        hash: &str,
+        baseline: Option<u64>,
+        now: u64,
+    ) -> Result<bool, String> {
+        if self.marks.contains_key(&hash.to_ascii_lowercase()) {
+            return Ok(false);
+        }
+        self.mark(hash, baseline, now)?;
+        Ok(true)
+    }
+
+    /// Removes the mark of a send with a definitive result.
+    pub(crate) fn clear(&mut self, hash: &str) -> Result<(), String> {
+        if self.marks.remove(&hash.to_ascii_lowercase()).is_some() {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Marks a send and writes the state file.
     pub(crate) fn mark(
         &mut self,
         hash: &str,

@@ -53,7 +53,7 @@ use tokio::time::Instant;
 // Keep in sync with the `ldk-server-client` rev pinned in Cargo.toml so the
 // daemon under test always speaks the protocol the client was generated from.
 const LDK_SERVER_REPO: &str = "https://github.com/joemphilips/ldk-server";
-const LDK_SERVER_REV: &str = "95b2011910c2465a2c5620c65fbe0377c47f7a93";
+const LDK_SERVER_REV: &str = "9565a7435debe3811a84ff70d27d96fad37afece";
 /// The only LDK Server permissions the processor needs.
 const PROCESSOR_PERMISSIONS: [&str; 5] = [
     "node:read",

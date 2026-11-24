@@ -2121,7 +2121,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-client"
 version = "0.1.0"
-source = "git+https://github.com/joemphilips/ldk-server?rev=95b2011910c2465a2c5620c65fbe0377c47f7a93#95b2011910c2465a2c5620c65fbe0377c47f7a93"
+source = "git+https://github.com/joemphilips/ldk-server?rev=9565a7435debe3811a84ff70d27d96fad37afece#9565a7435debe3811a84ff70d27d96fad37afece"
 dependencies = [
  "hyper",
  "ldk-server-grpc",
@@ -2133,7 +2133,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-grpc"
 version = "0.1.0"
-source = "git+https://github.com/joemphilips/ldk-server?rev=95b2011910c2465a2c5620c65fbe0377c47f7a93#95b2011910c2465a2c5620c65fbe0377c47f7a93"
+source = "git+https://github.com/joemphilips/ldk-server?rev=9565a7435debe3811a84ff70d27d96fad37afece#9565a7435debe3811a84ff70d27d96fad37afece"
 dependencies = [
  "bytes",
  "http",
@@ -2146,7 +2146,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-macaroons"
 version = "0.1.0"
-source = "git+https://github.com/joemphilips/ldk-server?rev=95b2011910c2465a2c5620c65fbe0377c47f7a93#95b2011910c2465a2c5620c65fbe0377c47f7a93"
+source = "git+https://github.com/joemphilips/ldk-server?rev=9565a7435debe3811a84ff70d27d96fad37afece#9565a7435debe3811a84ff70d27d96fad37afece"
 dependencies = [
  "bitcoin_hashes 0.14.101",
  "hex-conservative 0.2.2",
@@ -3770,7 +3770,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

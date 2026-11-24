@@ -43,7 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or 14 days after the mark end the mark. A "Node is not running" error and a
   failed connection do not mark. The marks are in the required file
   `ldk.state_path` (`LDK_STATE_PATH`), written atomically; a start refuses a
-  file that cannot be parsed.
+  file that cannot be parsed. Each send is marked before its dispatch and
+  unmarked after a definitive result, so a send that the mint cancels keeps
+  its mark. When the processor cannot write a mark, it exits with code 70
+  before the send. The matched LDK Node texts come from
+  `ldk_server_grpc::node_error_messages`, which an LDK Server test compares
+  with LDK Node.
 - An incoming status check by payment hash ends at the newest match. A scan
   that reaches `ldk.max_payment_scan_pages` returns the matches that it found
   and fails only when it found none. Before, a node with more than 1,600
