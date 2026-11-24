@@ -51,3 +51,17 @@ lightning-invoice = { version = "0.34", optional = true }
 name = "regtest"
 path = "tests/regtest.rs"
 required-features = ["regtest-tests"]
+
+# bitCaster fork only: build against the bitCaster CDK fork, so that this
+# processor speaks to the cdk-mintd of that fork. Remove this section before an
+# upstream pull request.
+[patch.crates-io]
+cashu = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
+cdk = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
+cdk-axum = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
+cdk-common = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
+cdk-http-client = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
+cdk-payment-processor = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
+cdk-signatory = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
+cdk-sql-common = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
+cdk-sqlite = { git = "https://github.com/joemphilips/cdk", rev = "fee0f9d4d63b4d121c608b6e43e407e4b080d50e" }
