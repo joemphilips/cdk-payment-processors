@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The release build has `panic = "abort"`. A panic ends the process, so that no
   processor runs on without one of its tasks. A release build with another
   panic strategy fails.
+- Updated LDK Server to a revision where `payments:send` permits `Bolt11Send`
+  and `Bolt12Send` only, and where LDK Server creates no mnemonic. The regtest
+  suite writes the mnemonic of each node before its start.
 
 ### Fixed
 

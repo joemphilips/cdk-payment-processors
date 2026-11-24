@@ -53,7 +53,7 @@ use tokio::time::Instant;
 // Keep in sync with the `ldk-server-client` rev pinned in Cargo.toml so the
 // daemon under test always speaks the protocol the client was generated from.
 const LDK_SERVER_REPO: &str = "https://github.com/joemphilips/ldk-server";
-const LDK_SERVER_REV: &str = "9565a7435debe3811a84ff70d27d96fad37afece";
+const LDK_SERVER_REV: &str = "70af0c50cb25b3ae33ac2793ff69a4a0cb95d8e1";
 /// The only LDK Server permissions the processor needs.
 const PROCESSOR_PERMISSIONS: [&str; 5] = [
     "node:read",
@@ -62,6 +62,11 @@ const PROCESSOR_PERMISSIONS: [&str; 5] = [
     "payments:send",
     "events:read",
 ];
+/// LDK Server creates no mnemonic, so each node gets one before its start. Regtest only: BIP39
+/// test vectors. Never use them with real funds.
+const PAYER_MNEMONIC: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+const MINT_MNEMONIC: &str =
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
 const FEE_RESERVE_PADDING_SAT: u64 = 50;
@@ -289,10 +294,12 @@ impl LdkNode {
     async fn start(
         bitcoind: &Bitcoind,
         alias: &str,
+        mnemonic: &str,
         storage_dir: PathBuf,
         binary: &Path,
     ) -> Result<Self> {
         std::fs::create_dir_all(&storage_dir)?;
+        std::fs::write(storage_dir.join("keys_mnemonic"), format!("{mnemonic}\n"))?;
         let grpc_port = pick_port();
         let p2p_port = pick_port();
         let (rpc_host, rpc_port, rpc_user, rpc_password) = bitcoind.rpc_details()?;
@@ -1428,6 +1435,7 @@ async fn ldk_server_regtest_suite() -> Result<()> {
     let payer = LdkNode::start(
         &bitcoind,
         "ldk-regtest-payer",
+        PAYER_MNEMONIC,
         run_dir.join("node-payer"),
         &binary,
     )
@@ -1437,6 +1445,7 @@ async fn ldk_server_regtest_suite() -> Result<()> {
     let mint_node = LdkNode::start(
         &bitcoind,
         "ldk-regtest-mint",
+        MINT_MNEMONIC,
         run_dir.join("node-mint"),
         &binary,
     )

@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # ldk-server deps
 
 bitcoin = { version = "0.32.2", features = ["base64", "serde", "rand", "rand-std"] }
-ldk-server-client = { git = "https://github.com/joemphilips/ldk-server", rev = "9565a7435debe3811a84ff70d27d96fad37afece", default-features = false }
+ldk-server-client = { git = "https://github.com/joemphilips/ldk-server", rev = "70af0c50cb25b3ae33ac2793ff69a4a0cb95d8e1", default-features = false }
 lightning = { version = "0.2.0", default-features = false, features = ["std"] }
 tokio-util = "0.7"
 

@@ -135,8 +135,12 @@ Boolean environment variables accept only the literal values `true` and
 
 LDK Server authenticates each request with a macaroon. The processor needs only
 these permissions: `node:read`, `invoices:create`, `payments:read`,
-`payments:send` and `events:read`. Create a separate macaroon for the
-processor, so that you can revoke it alone:
+`payments:send` and `events:read`. In the pinned LDK Server, `payments:send`
+permits `Bolt11Send` and `Bolt12Send` only. Thus the credential pays invoices
+and offers, and cannot send on-chain funds or channel funds to an address.
+(Upstream LDK Server permits also `SpliceOut`, `UnifiedSend` and other sends
+with it.) Create a separate macaroon for the processor, so that you can revoke
+it alone:
 
 ```bash
 ldk-server-cli create-macaroon cdk-processor \
@@ -224,6 +228,9 @@ The `ldk-server` daemon itself is resolved as follows:
 - Otherwise the upstream repository is cloned into
   `target/ldk-server-src` at the same revision pinned in `Cargo.toml` and
   built once into `target/ldk-server-build/debug/ldk-server`.
+
+LDK Server creates no mnemonic. The suite writes a fixed regtest mnemonic to
+`keys_mnemonic` of each node before its start.
 
 Artifacts (daemon logs, configs, mint database) are kept under
 `target/ldk-server-regtest/run-<timestamp>/`; set `TEST_DIRECTORY` to change
