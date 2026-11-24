@@ -517,8 +517,13 @@ impl LdkServerBackend {
                     return Ok(unknown_payment_response(payment_identifier));
                 }
                 // A send can start and end during the history scan. Read the
-                // record again after the mark and running checks.
-                if let Some(payment) = self.get_payment_details(hash).await? {
+                // record again after the mark and running checks. A receive
+                // stored under the same ID is not the send.
+                if let Some(payment) = self
+                    .get_payment_details(hash)
+                    .await?
+                    .filter(|payment| is_bolt11_send(payment, hash))
+                {
                     let verdict = self.uncertain_sends.lock().await.verdict(
                         hash,
                         Some(&payment),
@@ -1281,20 +1286,16 @@ impl MintPayment for LdkServerBackend {
             }
             PaymentIdentifier::PaymentHash(hash) => {
                 let hash = hex::encode(hash);
-                let is_bolt11_send = |payment: &Payment| {
-                    matches!(payment_direction(payment), Ok(PaymentDirection::Outbound))
-                        && matches!(
-                            payment_kind(payment),
-                            Ok(payment_kind::Kind::Bolt11(bolt11))
-                                if bolt11.hash.eq_ignore_ascii_case(&hash)
-                        )
-                };
                 // LDK Node uses the invoice payment hash as the payment ID of a
                 // BOLT11 send, so a direct lookup avoids a history scan.
                 let payment = match self.get_payment_details(&hash).await? {
-                    Some(payment) if is_bolt11_send(&payment) => Some(payment),
+                    Some(payment) if is_bolt11_send(&payment, &hash) => Some(payment),
                     _ => select_bolt11_payment(
-                        self.list_matching_payments(is_bolt11_send, false).await?,
+                        self.list_matching_payments(
+                            |payment| is_bolt11_send(payment, &hash),
+                            false,
+                        )
+                        .await?,
                     ),
                 };
 
@@ -1680,6 +1681,17 @@ fn payment_direction(payment: &Payment) -> Result<PaymentDirection, Error> {
 
 fn payment_status(payment: &Payment) -> Result<PaymentStatus, Error> {
     PaymentStatus::from_i32(payment.status).ok_or(Error::UnknownPaymentStatus(payment.status))
+}
+
+/// True when `payment` is an outbound BOLT11 payment of `hash`. A BOLT11
+/// receive can have the same payment ID: LDK Node 0.7 stored a receive under
+/// its payment hash, and a node state moved from it keeps such records.
+fn is_bolt11_send(payment: &Payment, hash: &str) -> bool {
+    matches!(payment_direction(payment), Ok(PaymentDirection::Outbound))
+        && matches!(
+            payment_kind(payment),
+            Ok(payment_kind::Kind::Bolt11(bolt11)) if bolt11.hash.eq_ignore_ascii_case(hash)
+        )
 }
 
 fn bolt11_amount_msat_for_quote(
@@ -3318,6 +3330,33 @@ mod fake_server_tests {
             .expect("the check answers");
 
         assert_eq!(status.status, MeltQuoteState::Paid);
+    }
+
+    #[tokio::test]
+    async fn a_receive_stored_under_the_hash_is_not_the_send_of_the_hash() {
+        // LDK Node 0.7 stored a BOLT11 receive under its payment hash, and a
+        // node state moved from it keeps such records. It is not a send of
+        // the hash.
+        let hash = hash_hex(6_000_018);
+        let receive = bolt11_payment(
+            hash.clone(),
+            hash.clone(),
+            PaymentDirection::Inbound,
+            PaymentStatus::Succeeded,
+            10,
+        );
+
+        let status = backend_with_sends(
+            FakeLdkServer::with_payments(vec![receive]),
+            32,
+            UncertainSends::in_memory_since(0),
+        )
+        .check_outgoing_payment(&PaymentIdentifier::PaymentHash(hash_bytes(&hash)))
+        .await
+        .expect("the check answers");
+
+        assert_eq!(status.status, MeltQuoteState::Failed);
+        assert_eq!(status.total_spent, Amount::new(0, CurrencyUnit::Msat));
     }
 
     #[tokio::test]

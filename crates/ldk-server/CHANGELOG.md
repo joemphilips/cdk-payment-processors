@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expires; `--clear-mark <hash>` removes one mark after an operator check. A
   hash with no record and no mark is `Unknown` while the state file is younger
   than 14 days. Before a `Failed` result, the processor reads the record again.
+  That read, as the first lookup, takes only an outbound BOLT11 record of the
+  hash. LDK Node 0.7 stored a BOLT11 receive under its payment hash, and a
+  node state moved from it keeps such records, so a receive could make a melt
+  that the node never sent report `Paid`.
 - A running processor holds an exclusive lock on `<state file>.lock`.
   `--init-state` and `--clear-mark` refuse while it runs, and a second
   processor with the same state file does not start. Before, `--clear-mark`
