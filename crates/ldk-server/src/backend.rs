@@ -575,7 +575,6 @@ impl MintPayment for LdkServerBackend {
                     context.clone(),
                 )
                 .await;
-                let payment_id = hex_to_array(&response.payment_id)?;
                 let payment = self
                     .wait_for_payment_details(&response.payment_id, bolt11_options.timeout_secs)
                     .await?;
@@ -588,7 +587,7 @@ impl MintPayment for LdkServerBackend {
 
                 let payment_response = Self::make_payment_response_from_payment(
                     unit,
-                    PaymentIdentifier::PaymentId(payment_id),
+                    outgoing_payment_lookup_id(&payment)?,
                     &payment,
                 )?;
                 if matches!(
@@ -628,7 +627,6 @@ impl MintPayment for LdkServerBackend {
                     context.clone(),
                 )
                 .await;
-                let payment_id = hex_to_array(&response.payment_id)?;
                 let payment = self
                     .wait_for_payment_details(&response.payment_id, bolt12_options.timeout_secs)
                     .await?;
@@ -641,7 +639,7 @@ impl MintPayment for LdkServerBackend {
 
                 let payment_response = Self::make_payment_response_from_payment(
                     unit,
-                    PaymentIdentifier::PaymentId(payment_id),
+                    outgoing_payment_lookup_id(&payment)?,
                     &payment,
                 )?;
                 if matches!(
@@ -876,17 +874,23 @@ impl MintPayment for LdkServerBackend {
             }
             PaymentIdentifier::PaymentHash(hash) => {
                 let hash = hex::encode(hash);
-                let payments = self
-                    .list_matching_payments(|payment| {
-                        matches!(payment_direction(payment), Ok(PaymentDirection::Outbound))
-                            && matches!(
-                                payment_kind(payment),
-                                Ok(payment_kind::Kind::Bolt11(bolt11))
-                                    if bolt11.hash.eq_ignore_ascii_case(&hash)
-                            )
-                    })
-                    .await?;
-                let payment = select_bolt11_payment(payments).ok_or(Error::PaymentNotFound)?;
+                let is_bolt11_send = |payment: &Payment| {
+                    matches!(payment_direction(payment), Ok(PaymentDirection::Outbound))
+                        && matches!(
+                            payment_kind(payment),
+                            Ok(payment_kind::Kind::Bolt11(bolt11))
+                                if bolt11.hash.eq_ignore_ascii_case(&hash)
+                        )
+                };
+                // LDK Node uses the invoice payment hash as the payment ID of a
+                // BOLT11 send, so a direct lookup avoids a history scan.
+                let payment = match self.get_payment_details(&hash).await? {
+                    Some(payment) if is_bolt11_send(&payment) => payment,
+                    _ => {
+                        let payments = self.list_matching_payments(is_bolt11_send).await?;
+                        select_bolt11_payment(payments).ok_or(Error::PaymentNotFound)?
+                    }
+                };
 
                 Self::make_payment_response_from_payment(
                     &CurrencyUnit::Msat,
@@ -1110,8 +1114,7 @@ fn map_outgoing_payment_event(
 ) -> Result<Event, payment::Error> {
     match outcome {
         OutgoingPaymentOutcome::Succeeded => {
-            let payment_lookup_id =
-                PaymentIdentifier::PaymentId(hex_to_array(&payment.payment_id)?);
+            let payment_lookup_id = outgoing_payment_lookup_id(payment)?;
             let details = LdkServerBackend::make_payment_response_from_payment(
                 &context.unit,
                 payment_lookup_id,
@@ -1139,6 +1142,24 @@ fn map_outgoing_payment_event(
                 reason,
             })
         }
+    }
+}
+
+/// The lookup ID that the mint stores for an outgoing payment.
+///
+/// A BOLT11 melt quote is keyed by the invoice payment hash
+/// (`get_payment_quote`), so every BOLT11 result reports that hash. A BOLT12
+/// quote has no lookup ID, and the mint stores the LDK payment ID that
+/// `make_payment` returns. A mint that requires exact lookup IDs rejects any
+/// other ID.
+fn outgoing_payment_lookup_id(payment: &Payment) -> Result<PaymentIdentifier, Error> {
+    match payment_kind(payment)? {
+        payment_kind::Kind::Bolt11(bolt11) => {
+            Ok(PaymentIdentifier::PaymentHash(hex_to_array(&bolt11.hash)?))
+        }
+        _ => Ok(PaymentIdentifier::PaymentId(hex_to_array(
+            &payment.payment_id,
+        )?)),
     }
 }
 
@@ -1423,7 +1444,7 @@ mod tests {
     use ldk_server_client::ldk_server_grpc::events::{
         PaymentFailed as LdkPaymentFailed, PaymentSuccessful as LdkPaymentSuccessful,
     };
-    use ldk_server_client::ldk_server_grpc::types::{Bolt11, PaymentKind};
+    use ldk_server_client::ldk_server_grpc::types::{Bolt11, Bolt12Offer, PaymentKind};
     use lightning::offers::offer::OfferBuilder;
 
     fn test_bolt11_payment(status: PaymentStatus, amount_msat: Option<u64>) -> Payment {
@@ -1553,13 +1574,63 @@ mod tests {
         };
 
         assert_eq!(event_quote_id, quote_id);
+        // A BOLT11 melt quote is keyed by the invoice payment hash ("01" * 32
+        // in the fixture). The event must carry the same lookup ID.
         assert_eq!(
             details.payment_lookup_id,
-            PaymentIdentifier::PaymentId([2; 32])
+            PaymentIdentifier::PaymentHash([1; 32])
         );
         assert_eq!(details.status, MeltQuoteState::Paid);
         assert_eq!(details.total_spent, Amount::new(2, CurrencyUnit::Sat));
         assert!(correlator_is_idle(&correlations).await);
+    }
+
+    #[tokio::test]
+    async fn successful_bolt12_event_keeps_the_payment_id() {
+        let correlations = OutgoingPaymentCorrelator::new();
+        let quote_id = QuoteId::new();
+        remember_outgoing_payment_context(
+            &correlations,
+            &"02".repeat(32),
+            OutgoingPaymentContext {
+                quote_id: quote_id.clone(),
+                unit: CurrencyUnit::Msat,
+            },
+        )
+        .await;
+        let payment = Payment {
+            kind: Some(PaymentKind {
+                kind: Some(payment_kind::Kind::Bolt12Offer(Bolt12Offer {
+                    hash: Some("01".repeat(32)),
+                    preimage: Some("03".repeat(32)),
+                    secret: None,
+                    offer_id: "04".repeat(32),
+                    payer_note: None,
+                    quantity: None,
+                })),
+            }),
+            ..test_bolt11_payment(PaymentStatus::Succeeded, Some(1_000))
+        };
+        let envelope = EventEnvelope {
+            event: Some(event_envelope::Event::PaymentSuccessful(successful_event(
+                payment,
+            ))),
+        };
+
+        let event = LdkServerBackend::event_from_envelope(envelope, &correlations)
+            .await
+            .expect("successful event should map")
+            .expect("successful event should be emitted");
+        let Event::PaymentSuccessful { details, .. } = event else {
+            panic!("expected outgoing payment success event");
+        };
+
+        // A BOLT12 melt quote has no lookup ID. The mint stores the ID that
+        // make_payment returns, which is the LDK payment ID ("02" * 32).
+        assert_eq!(
+            details.payment_lookup_id,
+            PaymentIdentifier::PaymentId([2; 32])
+        );
     }
 
     #[tokio::test]

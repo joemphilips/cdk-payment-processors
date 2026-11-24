@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- BOLT11 `make_payment` results and outgoing success events now report the
+  invoice payment hash, the lookup ID of the BOLT11 melt quote, instead of the
+  LDK payment ID. A mint that requires the lookup ID of the quote no longer
+  rejects every BOLT11 melt or drops its success event. BOLT12 results keep the
+  LDK payment ID.
+- An outgoing status check by payment hash reads the BOLT11 send directly
+  before it scans the payment history.
 - Fixed intermittent `Payment not found` failures in the direct BOLT11 send and
   gRPC melt regtest scenarios by waiting for payment history to catch up with
   live payment status before asserting hash-based results.

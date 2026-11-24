@@ -3,6 +3,11 @@
 A CDK payment processor backed by an [LDK Server](https://github.com/lightningdevkit/ldk-server) node. Exposes the node to `cdk-mintd` over the CDK payment processor gRPC protocol, with BOLT11 and BOLT12 (offers) support.
 
 The processor correlates outgoing LDK payment events with CDK melt quote IDs.
+Every BOLT11 melt result and event reports the invoice payment hash, which is
+the lookup ID of the BOLT11 melt quote. A BOLT12 melt result reports the LDK
+payment ID, because a BOLT12 melt quote has no lookup ID before the payment
+starts. A status check by payment hash reads the BOLT11 send directly, because
+LDK Node uses the payment hash as the payment ID of a BOLT11 send.
 When a payment initially returns as pending, a later success event finalizes
 the melt and a permanent failure event allows CDK to compensate it. Terminal
 events that arrive before the quote ID is known are buffered briefly and

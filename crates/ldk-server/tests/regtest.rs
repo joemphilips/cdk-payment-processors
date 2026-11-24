@@ -856,7 +856,11 @@ async fn bolt12_receive_scenario(payer: &LdkNode, backend: &LdkServerBackend) ->
     Ok(())
 }
 
-async fn bolt11_send_scenario(payer: &LdkNode, backend: &LdkServerBackend) -> Result<()> {
+async fn bolt11_send_scenario(
+    payer: &LdkNode,
+    node: &LdkNode,
+    backend: &LdkServerBackend,
+) -> Result<()> {
     let invoice = payer_invoice(payer, Some(9_000_000), "melt me").await?;
     let payment_hash: [u8; 32] = *invoice.payment_hash().as_ref();
 
@@ -895,6 +899,12 @@ async fn bolt11_send_scenario(payer: &LdkNode, backend: &LdkServerBackend) -> Re
             bolt11_options(invoice, QuoteId::new(), quoted_fee, None),
         )
         .await?;
+    // A mint that requires exact lookup IDs rejects any other ID.
+    assert_eq!(
+        Some(started.payment_lookup_id.clone()),
+        quote.request_lookup_id,
+        "make_payment must return the lookup ID of the quote"
+    );
     if started.status == MeltQuoteState::Pending {
         await_terminal(backend, &started.payment_lookup_id).await?;
     }
@@ -915,10 +925,28 @@ async fn bolt11_send_scenario(payer: &LdkNode, backend: &LdkServerBackend) -> Re
         "total spent {spent_msat} msat outside expected range"
     );
 
+    // LDK Node uses the payment hash of a BOLT11 invoice as its payment ID.
     let by_id = backend
-        .check_outgoing_payment(&started.payment_lookup_id)
-        .await?;
+        .check_outgoing_payment(&PaymentIdentifier::PaymentId(payment_hash))
+        .await
+        .context("BOLT11 send lookup by payment ID")?;
     assert_eq!(by_id.status, MeltQuoteState::Paid);
+    assert_eq!(by_id.payment_proof, by_hash.payment_proof);
+
+    // A hash lookup of a BOLT11 send must not scan the payment history.
+    let no_scan = LdkServerBackend::new(BackendConfig {
+        max_payment_scan_pages: 0,
+        ..backend_config(node)
+    })?;
+    let without_scan = no_scan
+        .check_outgoing_payment(&PaymentIdentifier::PaymentHash(payment_hash))
+        .await
+        .context("BOLT11 send lookup by hash without a history scan")?;
+    assert_eq!(without_scan.status, MeltQuoteState::Paid);
+    assert_eq!(
+        without_scan.payment_lookup_id,
+        PaymentIdentifier::PaymentHash(payment_hash)
+    );
     Ok(())
 }
 
@@ -1196,6 +1224,11 @@ async fn processor_scenario(payer: &LdkNode, node: &LdkNode, logs: &Path) -> Res
             bolt11_options(invoice, QuoteId::new(), quote.fee.to_u64(), None),
         )
         .await?;
+    assert_eq!(
+        Some(started.payment_lookup_id.clone()),
+        quote.request_lookup_id,
+        "make_payment over gRPC must return the lookup ID of the quote"
+    );
     let paid = if started.status == MeltQuoteState::Pending {
         await_terminal(&client, &started.payment_lookup_id)
             .await
@@ -1408,7 +1441,7 @@ async fn ldk_server_regtest_suite() -> Result<()> {
     bolt12_receive_scenario(&payer, &backend)
         .await
         .context("bolt12 receive")?;
-    bolt11_send_scenario(&payer, &backend)
+    bolt11_send_scenario(&payer, &mint_node, &backend)
         .await
         .context("bolt11 send")?;
     amountless_send_scenario(&payer, &backend)
