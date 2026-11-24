@@ -44,13 +44,48 @@ pub(crate) enum SendVerdict {
 pub(crate) struct UncertainSends {
     /// The state file. `None` keeps the marks in memory only.
     path: Option<PathBuf>,
+    /// The exclusive lock on the state file while these marks are open.
+    _lock: Option<File>,
     /// Local Unix time when the state file was created.
     created_at: u64,
     marks: HashMap<String, UncertainSend>,
 }
 
-/// Creates the state file of a new processor. Refuses a file that exists.
+/// Takes the exclusive lock of the state file, or refuses while another
+/// process holds it.
+///
+/// Each write replaces the state file by a rename, so a lock on the state file
+/// itself would stay on the replaced file. The lock is on `<state file>.lock`,
+/// which is never replaced. The lock ends when the returned file closes, also
+/// when the process ends.
+fn lock_state_file(path: &Path) -> Result<File, String> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open the lock file {}: {error}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "a running processor holds the state file {}; stop it first",
+            path.display()
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(format!(
+            "cannot lock the state file {}: {error}",
+            lock_path.display()
+        )),
+    }
+}
+
+/// Creates the state file of a new processor. Refuses a file that exists, and
+/// refuses while a running processor holds the state file.
 pub fn init_state_file(path: &Path, now: u64) -> Result<(), String> {
+    let lock = lock_state_file(path)?;
     if path.exists() {
         return Err(format!(
             "the state file {} exists; a new file would drop its marks",
@@ -59,6 +94,7 @@ pub fn init_state_file(path: &Path, now: u64) -> Result<(), String> {
     }
     let sends = UncertainSends {
         path: Some(path.to_path_buf()),
+        _lock: Some(lock),
         created_at: now,
         marks: HashMap::new(),
     };
@@ -66,7 +102,8 @@ pub fn init_state_file(path: &Path, now: u64) -> Result<(), String> {
 }
 
 /// Removes one mark from the state file, after an operator resolved its send.
-/// Returns false when the hash has no mark.
+/// Returns false when the hash has no mark. Refuses while a running processor
+/// holds the state file: the processor would write its own marks back.
 pub fn clear_mark(path: &Path, hash: &str) -> Result<bool, String> {
     let mut sends = UncertainSends::open(path.to_path_buf())?;
     let had_mark = sends.marks.contains_key(&hash.to_ascii_lowercase());
@@ -85,6 +122,7 @@ impl UncertainSends {
     pub(crate) fn in_memory_since(created_at: u64) -> Self {
         Self {
             path: None,
+            _lock: None,
             created_at,
             marks: HashMap::new(),
         }
@@ -93,10 +131,15 @@ impl UncertainSends {
     /// Opens the state file and writes it back, so that a start fails when the
     /// file cannot be written.
     ///
+    /// The returned marks hold the exclusive lock of the state file until they
+    /// drop. A second open refuses meanwhile, so one state file has one
+    /// processor, and the state commands do not run beside a processor.
+    ///
     /// A missing file is an error: a lost file would drop every mark. Only
     /// `init_state_file` creates it. A file that cannot be read or parsed is
     /// also an error.
     pub(crate) fn open(path: PathBuf) -> Result<Self, String> {
+        let lock = lock_state_file(&path)?;
         let (created_at, marks) = match std::fs::read_to_string(&path) {
             Ok(text) => parse(&text).map_err(|error| {
                 format!("cannot parse the state file {}: {error}", path.display())
@@ -117,6 +160,7 @@ impl UncertainSends {
         };
         let sends = Self {
             path: Some(path),
+            _lock: Some(lock),
             created_at,
             marks,
         };
@@ -403,12 +447,47 @@ mod tests {
         let mut sends = opened(&directory);
         sends.mark(&hash(1), None, 5_000).unwrap();
         sends.mark(&hash(2), None, 5_001).unwrap();
+        // The processor stops before the operator command.
+        drop(sends);
 
         assert!(clear_mark(&directory.file(), &hash(1)).unwrap());
         assert!(!clear_mark(&directory.file(), &hash(1)).unwrap());
         let reopened = UncertainSends::open(directory.file()).unwrap();
         assert_eq!(reopened.marks.len(), 1);
         assert!(reopened.marks.contains_key(&hash(2)));
+    }
+
+    #[test]
+    fn a_running_processor_refuses_the_state_commands_and_a_second_processor() {
+        let directory = TestDirectory::new();
+        let mut running = opened(&directory);
+        running.mark(&hash(1), None, 5_000).unwrap();
+
+        // --clear-mark writes its own snapshot of the file. The running
+        // processor would drop a mark that it writes meanwhile, and write the
+        // cleared mark back.
+        let error = clear_mark(&directory.file(), &hash(1)).unwrap_err();
+        assert!(error.contains("running processor"), "{error}");
+        running.mark(&hash(2), None, 5_001).unwrap();
+        let text = std::fs::read_to_string(directory.file()).unwrap();
+        assert!(text.contains(&hash(1)) && text.contains(&hash(2)), "{text}");
+
+        // A second processor on the same file has its own marks.
+        let error = UncertainSends::open(directory.file()).unwrap_err();
+        assert!(error.contains("running processor"), "{error}");
+
+        // --init-state refuses also when the state file itself is missing.
+        std::fs::remove_file(directory.file()).unwrap();
+        let error = init_state_file(&directory.file(), 8).unwrap_err();
+        assert!(error.contains("running processor"), "{error}");
+        assert!(!directory.file().exists());
+
+        running.mark(&hash(3), None, 5_002).unwrap();
+        drop(running);
+        assert!(clear_mark(&directory.file(), &hash(1)).unwrap());
+        let reopened = UncertainSends::open(directory.file()).unwrap();
+        assert_eq!(reopened.marks.len(), 2);
+        assert!(!reopened.marks.contains_key(&hash(1)));
     }
 
     #[test]
@@ -428,8 +507,10 @@ mod tests {
                 hash(2)
             )
         );
+        let expected = sends.marks.clone();
+        drop(sends);
         let reopened = UncertainSends::open(directory.file()).unwrap();
-        assert_eq!(reopened.marks, sends.marks);
+        assert_eq!(reopened.marks, expected);
         let mut temporary = directory.file().into_os_string();
         temporary.push(".tmp");
         assert!(!PathBuf::from(temporary).exists());
@@ -477,6 +558,7 @@ mod tests {
             sends.verdict(&hash(1), Some(&newer), 5_020),
             SendVerdict::Record
         );
+        drop(sends);
         assert!(UncertainSends::open(directory.file())
             .unwrap()
             .marks
@@ -488,6 +570,7 @@ mod tests {
         let directory = TestDirectory::new();
         let mut sends = opened(&directory);
         sends.mark(&hash(1), Some(100), 5_000).unwrap();
+        drop(sends);
         let mut reopened = UncertainSends::open(directory.file()).unwrap();
 
         let stale = record(PaymentStatus::Failed, 100);

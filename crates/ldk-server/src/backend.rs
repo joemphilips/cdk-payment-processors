@@ -3074,6 +3074,7 @@ mod fake_server_tests {
         let after_restart = statuses(&restarted, &hash).await;
         server.upsert(send_record(&hash, PaymentStatus::Failed, 101));
         let after_failure = statuses(&restarted, &hash).await;
+        drop(restarted);
         let again = backend_with_sends(server, 32, opened_state(&state));
         let after_second_restart = statuses(&again, &hash).await;
         std::fs::remove_dir_all(&directory).unwrap();

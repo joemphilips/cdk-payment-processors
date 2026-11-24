@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expires; `--clear-mark <hash>` removes one mark after an operator check. A
   hash with no record and no mark is `Unknown` while the state file is younger
   than 14 days. Before a `Failed` result, the processor reads the record again.
+- A running processor holds an exclusive lock on `<state file>.lock`.
+  `--init-state` and `--clear-mark` refuse while it runs, and a second
+  processor with the same state file does not start. Before, `--clear-mark`
+  wrote its own copy of the file beside a running processor, so a mark that the
+  processor wrote meanwhile was lost, and the processor wrote the cleared mark
+  back.
 - An outgoing status check by payment hash reports `Failed` for a hash with
   no record, no mark and no running send. Before, it returned "Payment not
   found", and the mint kept a melt that LDK Server never got pending without
