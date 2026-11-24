@@ -38,6 +38,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
 use crate::settings::AdvertisedMethod;
+#[cfg(test)]
+use crate::uncertain_sends::IN_FLIGHT_BOUND_SECS;
 use crate::uncertain_sends::{SendVerdict, UncertainSends};
 
 const DEFAULT_INVOICE_EXPIRY_SECS: u32 = 36_000;
@@ -509,6 +511,27 @@ impl LdkServerBackend {
             (SendVerdict::Record, None) if missing_is_failed => {
                 if self.sends_in_progress.is_running(hash) {
                     return Ok(unknown_payment_response(payment_identifier));
+                }
+                if self.uncertain_sends.lock().await.is_young(unix_time()) {
+                    // A lost earlier state file can have held a mark for it.
+                    return Ok(unknown_payment_response(payment_identifier));
+                }
+                // A send can start and end during the history scan. Read the
+                // record again after the mark and running checks.
+                if let Some(payment) = self.get_payment_details(hash).await? {
+                    let verdict = self.uncertain_sends.lock().await.verdict(
+                        hash,
+                        Some(&payment),
+                        unix_time(),
+                    );
+                    return match verdict {
+                        SendVerdict::Unknown => Ok(unknown_payment_response(payment_identifier)),
+                        SendVerdict::Record => Self::make_payment_response_from_payment(
+                            &CurrencyUnit::Msat,
+                            payment_identifier.clone(),
+                            &payment,
+                        ),
+                    };
                 }
                 tracing::info!(
                     "BOLT11 send {} has no record and no mark: it was never sent",
@@ -2326,6 +2349,9 @@ mod fake_server_tests {
         observed_at_send: Vec<String>,
         /// The next `GetPaymentDetails` signals the first and waits for the second.
         hold_next_details: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        /// Stored after the next `ListPayments` builds its page, as a send that
+        /// ends during a history scan.
+        store_after_next_list: Option<Payment>,
     }
 
     #[derive(Default)]
@@ -2454,15 +2480,27 @@ mod fake_server_tests {
                 .map(|token| token.parse().expect("fake page token"))
                 .unwrap_or(0);
             let end = (start + PAGE_SIZE).min(state.payments.len());
-            Ok(ListPaymentsResponse {
+            let response = ListPaymentsResponse {
                 payments: state.payments[start..end].to_vec(),
                 next_page_token: (end < state.payments.len()).then(|| end.to_string()),
-            })
+            };
+            if let Some(payment) = state.store_after_next_list.take() {
+                state.payments.insert(0, payment);
+            }
+            Ok(response)
         }
 
         async fn subscribe_events(&self) -> Result<EventStream, LdkServerError> {
             unsupported()
         }
+    }
+
+    /// Opens the state file, and creates it first for a new test.
+    fn opened_state(path: &std::path::Path) -> UncertainSends {
+        if !path.exists() {
+            crate::uncertain_sends::init_state_file(path, unix_time()).unwrap();
+        }
+        UncertainSends::open(path.to_path_buf()).unwrap()
     }
 
     fn backend(server: Arc<FakeLdkServer>, max_payment_scan_pages: u16) -> LdkServerBackend {
@@ -2773,7 +2811,7 @@ mod fake_server_tests {
     async fn an_uncertain_send_without_a_record_is_unknown() {
         let hash = hash_hex(6_000_004);
         let server = FakeLdkServer::with_payments(vec![]);
-        let backend = backend(server, 32);
+        let backend = backend_with_sends(server, 32, UncertainSends::in_memory_since(0));
         // A hash that the node never stored and that has no mark was never sent.
         let never_sent = backend
             .check_outgoing_payment(&PaymentIdentifier::PaymentHash(hash_bytes(&hash)))
@@ -3021,11 +3059,7 @@ mod fake_server_tests {
         let server =
             FakeLdkServer::with_payments(vec![send_record(&hash, PaymentStatus::Failed, 100)]);
 
-        let first = backend_with_sends(
-            server.clone(),
-            32,
-            UncertainSends::open(state.clone()).unwrap(),
-        );
+        let first = backend_with_sends(server.clone(), 32, opened_state(&state));
         server.script_send(FakeSend::Fails(
             LdkServerErrorCode::InternalServerError,
             "Failed to persist data.",
@@ -3036,15 +3070,11 @@ mod fake_server_tests {
             .expect_err("the fake send fails");
         drop(first);
 
-        let restarted = backend_with_sends(
-            server.clone(),
-            32,
-            UncertainSends::open(state.clone()).unwrap(),
-        );
+        let restarted = backend_with_sends(server.clone(), 32, opened_state(&state));
         let after_restart = statuses(&restarted, &hash).await;
         server.upsert(send_record(&hash, PaymentStatus::Failed, 101));
         let after_failure = statuses(&restarted, &hash).await;
-        let again = backend_with_sends(server, 32, UncertainSends::open(state).unwrap());
+        let again = backend_with_sends(server, 32, opened_state(&state));
         let after_second_restart = statuses(&again, &hash).await;
         std::fs::remove_dir_all(&directory).unwrap();
 
@@ -3095,11 +3125,7 @@ mod fake_server_tests {
         let server =
             FakeLdkServer::with_payments(vec![send_record(&hash, PaymentStatus::Failed, 100)]);
         server.state.lock().unwrap().observed_file = Some(directory.file());
-        let backend = backend_with_sends(
-            server.clone(),
-            32,
-            UncertainSends::open(directory.file()).unwrap(),
-        );
+        let backend = backend_with_sends(server.clone(), 32, opened_state(&directory.file()));
         server.script_send(FakeSend::Stores(Box::new(send_record(
             &hash,
             PaymentStatus::Pending,
@@ -3135,7 +3161,7 @@ mod fake_server_tests {
         let backend = Arc::new(backend_with_sends(
             server.clone(),
             32,
-            UncertainSends::open(directory.file()).unwrap(),
+            opened_state(&directory.file()),
         ));
         let entered = Arc::new(tokio::sync::Notify::new());
         server.script_send(FakeSend::Hangs(entered.clone()));
@@ -3172,11 +3198,7 @@ mod fake_server_tests {
         let hash = hash_hex(6_000_012);
         let server =
             FakeLdkServer::with_payments(vec![send_record(&hash, PaymentStatus::Failed, 100)]);
-        let backend = backend_with_sends(
-            server.clone(),
-            32,
-            UncertainSends::open(directory.file()).unwrap(),
-        );
+        let backend = backend_with_sends(server.clone(), 32, opened_state(&directory.file()));
         server.script_send(FakeSend::Fails(
             LdkServerErrorCode::InternalServerError,
             "Failed to persist data.",
@@ -3213,11 +3235,7 @@ mod fake_server_tests {
         let hash = hash_hex(6_000_013);
         let server =
             FakeLdkServer::with_payments(vec![send_record(&hash, PaymentStatus::Failed, 100)]);
-        let mut backend = backend_with_sends(
-            server.clone(),
-            32,
-            UncertainSends::open(directory.file()).unwrap(),
-        );
+        let mut backend = backend_with_sends(server.clone(), 32, opened_state(&directory.file()));
         backend.on_state_write_failure = panic_on_state_write_failure;
         server.script_send(FakeSend::Stores(Box::new(send_record(
             &hash,
@@ -3284,5 +3302,63 @@ mod fake_server_tests {
 
         assert_eq!(during.status, MeltQuoteState::Unknown);
         assert_eq!(started.status, MeltQuoteState::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_send_that_ends_during_the_history_scan_reports_its_record() {
+        let hash = hash_hex(6_000_015);
+        let server = FakeLdkServer::with_payments(other_receives(3));
+        server.state.lock().unwrap().store_after_next_list =
+            Some(send_record(&hash, PaymentStatus::Succeeded, 200));
+
+        let status = backend_with_sends(server, 32, UncertainSends::in_memory_since(0))
+            .check_outgoing_payment(&PaymentIdentifier::PaymentHash(hash_bytes(&hash)))
+            .await
+            .expect("the check answers");
+
+        assert_eq!(status.status, MeltQuoteState::Paid);
+    }
+
+    #[tokio::test]
+    async fn an_expired_mark_without_a_record_is_unknown() {
+        let hash = hash_hex(6_000_016);
+        let server = FakeLdkServer::with_payments(vec![]);
+        let backend = backend(server, 32);
+        backend
+            .uncertain_sends
+            .lock()
+            .await
+            .mark(&hash, None, unix_time() - 100 * IN_FLIGHT_BOUND_SECS)
+            .unwrap();
+        assert_eq!(
+            statuses(&backend, &hash).await,
+            (MeltQuoteState::Unknown, MeltQuoteState::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_record_is_unknown_while_the_state_file_is_young() {
+        let hash = hash_hex(6_000_017);
+        let young = backend_with_sends(
+            FakeLdkServer::with_payments(vec![]),
+            32,
+            UncertainSends::in_memory_since(unix_time() - IN_FLIGHT_BOUND_SECS + 60),
+        );
+        let old = backend_with_sends(
+            FakeLdkServer::with_payments(vec![]),
+            32,
+            UncertainSends::in_memory_since(unix_time() - IN_FLIGHT_BOUND_SECS - 60),
+        );
+        for (backend, expected) in [
+            (young, MeltQuoteState::Unknown),
+            (old, MeltQuoteState::Failed),
+        ] {
+            let status = backend
+                .check_outgoing_payment(&PaymentIdentifier::PaymentHash(hash_bytes(&hash)))
+                .await
+                .unwrap()
+                .status;
+            assert_eq!(status, expected);
+        }
     }
 }

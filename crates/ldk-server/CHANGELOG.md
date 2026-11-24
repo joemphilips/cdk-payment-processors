@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the send. The matched LDK Node texts come from
   `ldk_server_grpc::node_error_messages`, which an LDK Server test compares
   with LDK Node.
+- The state file must exist: `--init-state` creates it, with its creation
+  time, and a start refuses a missing file. A mark without a record never
+  expires; `--clear-mark <hash>` removes one mark after an operator check. A
+  hash with no record and no mark is `Unknown` while the state file is younger
+  than 14 days. Before a `Failed` result, the processor reads the record again.
 - An outgoing status check by payment hash reports `Failed` for a hash with
   no record, no mark and no running send. Before, it returned "Payment not
   found", and the mint kept a melt that LDK Server never got pending without

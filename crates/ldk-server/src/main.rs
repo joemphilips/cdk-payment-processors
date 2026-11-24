@@ -14,6 +14,7 @@ use cdk_payment_processor::{
 };
 use cdk_payment_processor_ldk_server::backend::{Config as BackendConfig, LdkServerBackend};
 use cdk_payment_processor_ldk_server::settings::Config;
+use cdk_payment_processor_ldk_server::uncertain_sends;
 use tokio::signal;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing_subscriber::EnvFilter;
@@ -29,6 +30,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::load()?;
+    if let Some(command) = state_command(std::env::args().skip(1).collect())? {
+        return run_state_command(&cfg, command);
+    }
     let socket_addr = SocketAddr::new(
         cfg.address
             .parse::<IpAddr>()
@@ -99,6 +103,55 @@ async fn main() -> Result<()> {
         Ok(Ok(())) => tracing::info!("Server stopped gracefully"),
         Ok(Err(e)) => return Err(e).context("gRPC server failed"),
         Err(e) => return Err(e).context("gRPC server task panicked"),
+    }
+    Ok(())
+}
+
+/// A one-shot operation on the state file of uncertain sends.
+#[derive(Debug, PartialEq, Eq)]
+enum StateCommand {
+    /// Create the state file of a new processor.
+    Init,
+    /// Remove the mark of one payment hash after an operator resolved it.
+    ClearMark(String),
+}
+
+const USAGE: &str =
+    "usage: cdk-payment-processor-ldk-server [--init-state | --clear-mark <payment hash>]";
+
+fn state_command(args: Vec<String>) -> Result<Option<StateCommand>> {
+    match args.as_slice() {
+        [] => Ok(None),
+        [flag] if flag == "--init-state" => Ok(Some(StateCommand::Init)),
+        [flag, hash] if flag == "--clear-mark" => {
+            anyhow::ensure!(
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "--clear-mark takes a 64-character hex payment hash"
+            );
+            Ok(Some(StateCommand::ClearMark(hash.to_ascii_lowercase())))
+        }
+        _ => anyhow::bail!("{USAGE}"),
+    }
+}
+
+fn run_state_command(cfg: &Config, command: StateCommand) -> Result<()> {
+    let path = std::path::PathBuf::from(
+        cfg.ldk
+            .state_path
+            .as_deref()
+            .context("ldk.state_path is required")?,
+    );
+    match command {
+        StateCommand::Init => {
+            uncertain_sends::init_state_file(&path, cdk_common::util::unix_time())
+                .map_err(anyhow::Error::msg)?;
+            tracing::info!("Created the state file {}", path.display());
+        }
+        StateCommand::ClearMark(hash) => {
+            let removed = uncertain_sends::clear_mark(&path, &hash).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(removed, "the state file has no mark for {hash}");
+            tracing::warn!("Removed the mark of BOLT11 send {hash}");
+        }
     }
     Ok(())
 }
@@ -242,6 +295,22 @@ mod tests {
             allow_insecure,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn state_commands_are_parsed_strictly() {
+        let hash = "AB".repeat(32);
+        assert_eq!(state_command(vec![]).unwrap(), None);
+        assert_eq!(
+            state_command(vec!["--init-state".into()]).unwrap(),
+            Some(StateCommand::Init)
+        );
+        assert_eq!(
+            state_command(vec!["--clear-mark".into(), hash.clone()]).unwrap(),
+            Some(StateCommand::ClearMark(hash.to_ascii_lowercase()))
+        );
+        assert!(state_command(vec!["--clear-mark".into(), "abc".into()]).is_err());
+        assert!(state_command(vec!["--init".into()]).is_err());
     }
 
     #[test]

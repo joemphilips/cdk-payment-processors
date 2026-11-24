@@ -18,7 +18,7 @@ use ldk_server_client::ldk_server_grpc::types::{Payment, PaymentStatus};
 /// days. Twice that time after a mark, the send of the mark has resolved.
 pub(crate) const IN_FLIGHT_BOUND_SECS: u64 = 14 * 24 * 60 * 60;
 
-const FILE_HEADER: &str = "cdk-payment-processor-ldk-server uncertain-sends v1";
+const FILE_HEADER: &str = "cdk-payment-processor-ldk-server uncertain-sends v2 created";
 
 /// A BOLT11 send whose call failed after the node possibly dispatched it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,14 +44,48 @@ pub(crate) enum SendVerdict {
 pub(crate) struct UncertainSends {
     /// The state file. `None` keeps the marks in memory only.
     path: Option<PathBuf>,
+    /// Local Unix time when the state file was created.
+    created_at: u64,
     marks: HashMap<String, UncertainSend>,
 }
 
+/// Creates the state file of a new processor. Refuses a file that exists.
+pub fn init_state_file(path: &Path, now: u64) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!(
+            "the state file {} exists; a new file would drop its marks",
+            path.display()
+        ));
+    }
+    let sends = UncertainSends {
+        path: Some(path.to_path_buf()),
+        created_at: now,
+        marks: HashMap::new(),
+    };
+    sends.persist()
+}
+
+/// Removes one mark from the state file, after an operator resolved its send.
+/// Returns false when the hash has no mark.
+pub fn clear_mark(path: &Path, hash: &str) -> Result<bool, String> {
+    let mut sends = UncertainSends::open(path.to_path_buf())?;
+    let had_mark = sends.marks.contains_key(&hash.to_ascii_lowercase());
+    sends.clear(hash)?;
+    Ok(had_mark)
+}
+
 impl UncertainSends {
-    /// Marks that a restart loses. For tests and library use only.
+    /// Marks that a restart loses. For tests and library use only. The marks
+    /// count as new, so a missing record is never taken as a send that did not
+    /// happen.
     pub(crate) fn in_memory() -> Self {
+        Self::in_memory_since(cdk_common::util::unix_time())
+    }
+
+    pub(crate) fn in_memory_since(created_at: u64) -> Self {
         Self {
             path: None,
+            created_at,
             marks: HashMap::new(),
         }
     }
@@ -59,15 +93,21 @@ impl UncertainSends {
     /// Opens the state file and writes it back, so that a start fails when the
     /// file cannot be written.
     ///
-    /// A missing file holds no marks. A file that cannot be read or parsed is
-    /// an error: without its marks, the processor could report a stale Failed
-    /// record.
+    /// A missing file is an error: a lost file would drop every mark. Only
+    /// `init_state_file` creates it. A file that cannot be read or parsed is
+    /// also an error.
     pub(crate) fn open(path: PathBuf) -> Result<Self, String> {
-        let marks = match std::fs::read_to_string(&path) {
+        let (created_at, marks) = match std::fs::read_to_string(&path) {
             Ok(text) => parse(&text).map_err(|error| {
                 format!("cannot parse the state file {}: {error}", path.display())
             })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "the state file {} is missing; restore it, or create the file of a new \
+                     processor with --init-state",
+                    path.display()
+                ))
+            }
             Err(error) => {
                 return Err(format!(
                     "cannot read the state file {}: {error}",
@@ -77,10 +117,18 @@ impl UncertainSends {
         };
         let sends = Self {
             path: Some(path),
+            created_at,
             marks,
         };
         sends.persist()?;
         Ok(sends)
+    }
+
+    /// True while the state file is younger than `IN_FLIGHT_BOUND_SECS`. A
+    /// send of a lost earlier file can then still be in flight, so a missing
+    /// record does not prove that a hash was never sent.
+    pub(crate) fn is_young(&self, now: u64) -> bool {
+        now.saturating_sub(self.created_at) < IN_FLIGHT_BOUND_SECS
     }
 
     /// Marks a send before its dispatch and writes the state file.
@@ -115,8 +163,6 @@ impl UncertainSends {
         baseline: Option<u64>,
         now: u64,
     ) -> Result<(), String> {
-        self.marks
-            .retain(|_, mark| now.saturating_sub(mark.marked_at) < IN_FLIGHT_BOUND_SECS);
         self.marks.insert(
             hash.to_ascii_lowercase(),
             UncertainSend {
@@ -130,8 +176,12 @@ impl UncertainSends {
     /// Decides whether `record`, the stored send for `hash`, can be reported.
     ///
     /// A mark ends with a Succeeded record, with a Failed record newer than the
-    /// record before the send, or `IN_FLIGHT_BOUND_SECS` after the mark. Until
-    /// then a Failed or missing record is `Unknown`.
+    /// record before the send, or `IN_FLIGHT_BOUND_SECS` after the mark when a
+    /// record exists. Until then a Failed or missing record is `Unknown`.
+    ///
+    /// A mark without a record never ends by time: LDK Node updates only a
+    /// record that exists, so a send whose Pending write failed can have paid
+    /// without any record. An operator resolves such a mark (`clear_mark`).
     pub(crate) fn verdict(
         &mut self,
         hash: &str,
@@ -143,7 +193,9 @@ impl UncertainSends {
             return SendVerdict::Record;
         };
         let status = record.and_then(|payment| PaymentStatus::from_i32(payment.status));
-        let current = now.saturating_sub(mark.marked_at) >= IN_FLIGHT_BOUND_SECS
+        let expired =
+            record.is_some() && now.saturating_sub(mark.marked_at) >= IN_FLIGHT_BOUND_SECS;
+        let current = expired
             || match (record, status) {
                 (Some(_), Some(PaymentStatus::Succeeded)) => true,
                 (Some(payment), Some(PaymentStatus::Failed)) => mark
@@ -170,12 +222,12 @@ impl UncertainSends {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        write_atomically(path, &format_marks(&self.marks))
+        write_atomically(path, &format_marks(self.created_at, &self.marks))
             .map_err(|error| format!("cannot write the state file {}: {error}", path.display()))
     }
 }
 
-fn format_marks(marks: &HashMap<String, UncertainSend>) -> String {
+fn format_marks(created_at: u64, marks: &HashMap<String, UncertainSend>) -> String {
     let mut lines: Vec<String> = marks
         .iter()
         .map(|(hash, mark)| {
@@ -186,8 +238,7 @@ fn format_marks(marks: &HashMap<String, UncertainSend>) -> String {
         })
         .collect();
     lines.sort();
-    let mut text = String::from(FILE_HEADER);
-    text.push('\n');
+    let mut text = format!("{FILE_HEADER} {created_at}\n");
     for line in lines {
         text.push_str(&line);
         text.push('\n');
@@ -195,11 +246,14 @@ fn format_marks(marks: &HashMap<String, UncertainSend>) -> String {
     text
 }
 
-fn parse(text: &str) -> Result<HashMap<String, UncertainSend>, String> {
+fn parse(text: &str) -> Result<(u64, HashMap<String, UncertainSend>), String> {
     let mut lines = text.lines();
-    if lines.next() != Some(FILE_HEADER) {
-        return Err(format!("the first line is not `{FILE_HEADER}`"));
-    }
+    let created_at = lines
+        .next()
+        .and_then(|line| line.strip_prefix(FILE_HEADER))
+        .and_then(|rest| rest.strip_prefix(' '))
+        .and_then(|time| time.parse().ok())
+        .ok_or_else(|| format!("the first line is not `{FILE_HEADER} <unix time>`"))?;
     let mut marks = HashMap::new();
     for (index, line) in lines.enumerate() {
         let number = index + 2;
@@ -238,7 +292,7 @@ fn parse(text: &str) -> Result<HashMap<String, UncertainSend>, String> {
             return Err(format!("line {number} repeats a payment hash"));
         }
     }
-    Ok(marks)
+    Ok((created_at, marks))
 }
 
 /// Writes a temporary file, flushes it, renames it over `path`, and flushes
@@ -315,20 +369,52 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_starts_empty_and_is_written() {
+    fn a_missing_file_refuses_to_open() {
+        // A lost file would drop every mark, so a start must not create it.
         let directory = TestDirectory::new();
-        let sends = UncertainSends::open(directory.file()).unwrap();
-        assert!(sends.marks.is_empty());
+        let error = UncertainSends::open(directory.file()).unwrap_err();
+        assert!(error.contains("missing"), "{error}");
+        assert!(!directory.file().exists());
+    }
+
+    fn opened(directory: &TestDirectory) -> UncertainSends {
+        init_state_file(&directory.file(), 7).unwrap();
+        UncertainSends::open(directory.file()).unwrap()
+    }
+
+    #[test]
+    fn init_writes_the_creation_time_and_refuses_an_existing_file() {
+        let directory = TestDirectory::new();
+        init_state_file(&directory.file(), 7).unwrap();
         assert_eq!(
             std::fs::read_to_string(directory.file()).unwrap(),
-            format!("{FILE_HEADER}\n")
+            format!("{FILE_HEADER} 7\n")
         );
+        let error = init_state_file(&directory.file(), 8).unwrap_err();
+        assert!(error.contains("exists"), "{error}");
+        let sends = UncertainSends::open(directory.file()).unwrap();
+        assert!(sends.is_young(7 + IN_FLIGHT_BOUND_SECS - 1));
+        assert!(!sends.is_young(7 + IN_FLIGHT_BOUND_SECS));
+    }
+
+    #[test]
+    fn an_operator_clears_one_mark() {
+        let directory = TestDirectory::new();
+        let mut sends = opened(&directory);
+        sends.mark(&hash(1), None, 5_000).unwrap();
+        sends.mark(&hash(2), None, 5_001).unwrap();
+
+        assert!(clear_mark(&directory.file(), &hash(1)).unwrap());
+        assert!(!clear_mark(&directory.file(), &hash(1)).unwrap());
+        let reopened = UncertainSends::open(directory.file()).unwrap();
+        assert_eq!(reopened.marks.len(), 1);
+        assert!(reopened.marks.contains_key(&hash(2)));
     }
 
     #[test]
     fn a_mark_is_in_the_file_before_mark_returns() {
         let directory = TestDirectory::new();
-        let mut sends = UncertainSends::open(directory.file()).unwrap();
+        let mut sends = opened(&directory);
         sends
             .mark(&hash(1).to_uppercase(), Some(100), 5_000)
             .unwrap();
@@ -336,7 +422,11 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(directory.file()).unwrap(),
-            format!("{FILE_HEADER}\n{} 100 5000\n{} - 5001\n", hash(1), hash(2))
+            format!(
+                "{FILE_HEADER} 7\n{} 100 5000\n{} - 5001\n",
+                hash(1),
+                hash(2)
+            )
         );
         let reopened = UncertainSends::open(directory.file()).unwrap();
         assert_eq!(reopened.marks, sends.marks);
@@ -350,10 +440,11 @@ mod tests {
         let directory = TestDirectory::new();
         for text in [
             "garbage\n".to_string(),
-            format!("{FILE_HEADER}\n{} 100\n", hash(1)),
-            format!("{FILE_HEADER}\nABCD 100 5000\n"),
-            format!("{FILE_HEADER}\n{} x 5000\n", hash(1)),
-            format!("{FILE_HEADER}\n{0} 1 2\n{0} 3 4\n", hash(1)),
+            format!("{FILE_HEADER}\n"),
+            format!("{FILE_HEADER} 7\n{} 100\n", hash(1)),
+            format!("{FILE_HEADER} 7\nABCD 100 5000\n"),
+            format!("{FILE_HEADER} 7\n{} x 5000\n", hash(1)),
+            format!("{FILE_HEADER} 7\n{0} 1 2\n{0} 3 4\n", hash(1)),
         ] {
             std::fs::write(directory.file(), &text).unwrap();
             let error = UncertainSends::open(directory.file()).unwrap_err();
@@ -366,7 +457,7 @@ mod tests {
     #[test]
     fn a_mark_ends_with_a_current_record_and_the_file_follows() {
         let directory = TestDirectory::new();
-        let mut sends = UncertainSends::open(directory.file()).unwrap();
+        let mut sends = opened(&directory);
         sends.mark(&hash(1), Some(100), 5_000).unwrap();
 
         let stale = record(PaymentStatus::Failed, 100);
@@ -395,7 +486,7 @@ mod tests {
     #[test]
     fn a_reopened_mark_ends_fourteen_days_after_the_mark() {
         let directory = TestDirectory::new();
-        let mut sends = UncertainSends::open(directory.file()).unwrap();
+        let mut sends = opened(&directory);
         sends.mark(&hash(1), Some(100), 5_000).unwrap();
         let mut reopened = UncertainSends::open(directory.file()).unwrap();
 
@@ -416,6 +507,23 @@ mod tests {
         let failed = record(PaymentStatus::Failed, 100);
         assert_eq!(
             sends.verdict(&hash(1), Some(&failed), 0),
+            SendVerdict::Record
+        );
+    }
+
+    #[test]
+    fn an_expired_mark_without_a_record_stays() {
+        // The node can have paid without a record: on success LDK Node updates
+        // only a record that exists.
+        let mut sends = UncertainSends::in_memory();
+        sends.mark(&hash(1), Some(100), 5_000).unwrap();
+        assert_eq!(
+            sends.verdict(&hash(1), None, 5_000 + IN_FLIGHT_BOUND_SECS * 10),
+            SendVerdict::Unknown
+        );
+        let stale = record(PaymentStatus::Failed, 100);
+        assert_eq!(
+            sends.verdict(&hash(1), Some(&stale), 5_000 + IN_FLIGHT_BOUND_SECS),
             SendVerdict::Record
         );
     }

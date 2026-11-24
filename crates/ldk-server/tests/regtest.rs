@@ -551,19 +551,33 @@ impl ProcessorProcess {
             std::fs::File::create(log_dir.join(format!("processor-{port}-{log_id}.out.log")))?;
         let stderr =
             std::fs::File::create(log_dir.join(format!("processor-{port}-{log_id}.err.log")))?;
-        let child = TokioCommand::new(env!("CARGO_BIN_EXE_cdk-payment-processor-ldk-server"))
-            .env("SERVER_ADDRESS", "127.0.0.1")
-            .env("SERVER_PORT", port.to_string())
-            .env("ALLOW_INSECURE", "true")
-            .env("LDK_ADDRESS", format!("127.0.0.1:{}", node.grpc_port))
-            .env("LDK_MACAROON", &node.processor_macaroon)
-            // A restart on the same port keeps the uncertain sends.
-            .env(
-                "LDK_STATE_PATH",
-                log_dir.join(format!("processor-state-{port}")),
-            )
-            .env("LDK_TLS_CERT_PATH", &node.tls_cert_path)
-            .env("RUST_LOG", "debug")
+        // A restart on the same port keeps the uncertain sends.
+        let state_path = log_dir.join(format!("processor-state-{port}"));
+        let processor = |command: &mut TokioCommand| {
+            command
+                .env("SERVER_ADDRESS", "127.0.0.1")
+                .env("SERVER_PORT", port.to_string())
+                .env("ALLOW_INSECURE", "true")
+                .env("LDK_ADDRESS", format!("127.0.0.1:{}", node.grpc_port))
+                .env("LDK_MACAROON", &node.processor_macaroon)
+                .env("LDK_STATE_PATH", &state_path)
+                .env("LDK_TLS_CERT_PATH", &node.tls_cert_path)
+                .env("RUST_LOG", "debug");
+        };
+        if !state_path.exists() {
+            let mut init =
+                TokioCommand::new(env!("CARGO_BIN_EXE_cdk-payment-processor-ldk-server"));
+            processor(&mut init);
+            let status = init
+                .arg("--init-state")
+                .status()
+                .await
+                .context("create the processor state file")?;
+            anyhow::ensure!(status.success(), "--init-state failed");
+        }
+        let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_cdk-payment-processor-ldk-server"));
+        processor(&mut command);
+        let child = command
             .stdout(stdout)
             .stderr(stderr)
             .spawn()

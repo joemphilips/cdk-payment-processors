@@ -27,17 +27,37 @@ the mint cancels during the send keeps its mark. The processor writes the file
 atomically. When it cannot write a mark, it stops with exit code 70 before the
 send; fix the state directory (space, permissions) and start it again.
 
+A mark ends after 14 days only when LDK Server has a record of the send. A
+mark without a record stays: a send whose Pending write failed can have paid,
+and LDK Node writes the result only to a record that exists. Such a payment is
+`Unknown` until an operator resolves it.
+
 A status check by payment hash reports `Failed` for a hash that LDK Server
-has no record of, that has no mark, and that no running send uses. Every
-send has a mark before its dispatch, so such a payment was never sent, for
-example because LDK Server was down at the melt. The mint then returns the
-proofs instead of keeping the melt pending. It
-does not start when the file exists but cannot be read or parsed. Then check
-each payment hash in the file with `ldk-server-cli get-payment-details <hash>`.
-When each one has a Succeeded record, or a Failed record newer than the
-baseline in its line, or the mark (the last number, a Unix time) is more than
-14 days old, move the file away and start the processor. Otherwise repair the
-file, or wait until the 14 days pass.
+has no record of, that has no mark, and that no running send uses, when the
+state file is older than 14 days. Every send has a mark before its dispatch,
+so such a payment was never sent, for example because LDK Server was down at
+the melt. The mint then returns the proofs. While the state file is younger
+than 14 days, such a hash is `Unknown`, because a lost earlier file can have
+held its mark.
+
+### State file
+
+- Create the file once for a new processor:
+  `cdk-payment-processor-ldk-server --init-state`. The command refuses a file
+  that exists. The file records its creation time.
+- The processor does not start when the file is missing, or when it cannot be
+  read or parsed. Never move the file away, delete it, or create a new one to
+  start the processor: a lost mark can make the mint release the proofs of a
+  paid melt. Restore or repair the file instead.
+- To resolve one mark, check the payment with
+  `ldk-server-cli get-payment-details <hash>`, and check with `list-channels`
+  that no HTLC of it is pending. When the payment did not pay and cannot pay
+  any more, stop the processor and run
+  `cdk-payment-processor-ldk-server --clear-mark <hash>`. The mint then gets a
+  definite result at its next status check.
+- Run one processor for one LDK Server node. A second processor has its own
+  marks, so after a double fault it can report a stale Failed record.
+
 When a payment initially returns as pending, a later success event finalizes
 the melt and a permanent failure event allows CDK to compensate it. Terminal
 events that arrive before the quote ID is known are buffered briefly and
