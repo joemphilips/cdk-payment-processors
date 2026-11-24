@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LDK payment ID.
 - An outgoing status check by payment hash reads the BOLT11 send directly
   before it scans the payment history.
+- A BOLT11 `Bolt11Send` that fails with a server or transport error does not
+  prove that nothing was dispatched: LDK Node dispatches before it stores the
+  Pending record. While such a send is uncertain, a status check reports
+  `Unknown` instead of an older Failed record. A Succeeded record, a newer
+  Failed record or 14 days end the uncertainty. After a restart, a Failed
+  BOLT11 record from before the start is `Unknown` for 14 days, unless this
+  process sent the payment again.
 - An incoming status check by payment hash ends at the newest match. A scan
   that reaches `ldk.max_payment_scan_pages` returns the matches that it found
   and fails only when it found none. Before, a node with more than 1,600

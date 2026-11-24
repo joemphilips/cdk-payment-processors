@@ -8,6 +8,16 @@ the lookup ID of the BOLT11 melt quote. A BOLT12 melt result reports the LDK
 payment ID, because a BOLT12 melt quote has no lookup ID before the payment
 starts. A status check by payment hash reads the BOLT11 send directly, because
 LDK Node uses the payment hash as the payment ID of a BOLT11 send.
+
+LDK Node dispatches a BOLT11 payment before it stores its Pending record. When
+`Bolt11Send` fails with a server or transport error, the payment can be in
+flight while the store still holds the Failed record of an earlier attempt.
+The processor then reports `Unknown` for that payment until a Succeeded
+record, a newer Failed record, or 14 days (twice the 1,008-block CLTV limit).
+The processor keeps this state in memory. After a restart, it reports a
+Failed BOLT11 record from before the start as `Unknown` for 14 days, unless it
+sent that payment again. A mint keeps such a melt pending; it does not release
+the proofs.
 When a payment initially returns as pending, a later success event finalizes
 the melt and a permanent failure event allows CDK to compensate it. Terminal
 events that arrive before the quote ID is known are buffered briefly and

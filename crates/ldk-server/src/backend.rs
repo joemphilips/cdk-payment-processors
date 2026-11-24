@@ -18,7 +18,7 @@ use cdk_common::util::{hex, unix_time};
 use cdk_common::QuoteId;
 use futures::Stream;
 use ldk_server_client::client::{EventStream, LdkServerClient};
-use ldk_server_client::error::LdkServerError;
+use ldk_server_client::error::{LdkServerError, LdkServerErrorCode};
 use ldk_server_client::ldk_server_grpc::api::{
     Bolt11ReceiveRequest, Bolt11ReceiveResponse, Bolt11SendRequest, Bolt11SendResponse,
     Bolt12ReceiveRequest, Bolt12ReceiveResponse, Bolt12SendRequest, Bolt12SendResponse,
@@ -44,6 +44,13 @@ const UNMATCHED_OUTGOING_EVENT_TTL: Duration = Duration::from_secs(60);
 /// 200 pages of 50 payments: a scan reads at most 10,000 payments.
 pub(crate) const DEFAULT_MAX_PAYMENT_SCAN_PAGES: u16 = 200;
 const ROUTE_DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA: u32 = 1008;
+/// An outgoing HTLC resolves within its CLTV limit of 1,008 blocks, about 7
+/// days. After twice that time, no earlier send of a payment hash can still
+/// be in flight.
+const IN_FLIGHT_BOUND_SECS: u64 = 14 * 24 * 60 * 60;
+/// LDK Server refuses a request whose time differs from its clock by more than
+/// 60 seconds, so the two clocks agree within this margin.
+const CLOCK_SKEW_SECS: u64 = 60;
 const ROUTE_DEFAULT_MAX_PATH_COUNT: u32 = 10;
 const ROUTE_DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF: u32 = 2;
 
@@ -106,6 +113,138 @@ impl OutgoingPaymentCorrelator {
 }
 
 type OutgoingPaymentCorrelations = OutgoingPaymentCorrelator;
+
+/// A BOLT11 send whose call failed after the node possibly dispatched it.
+#[derive(Clone, Copy, Debug)]
+struct UncertainSend {
+    /// `latest_update_timestamp` of the stored record before the send, by the
+    /// LDK Server clock. `None` when no record existed.
+    baseline: Option<u64>,
+    /// Local Unix time of the failed call.
+    marked_at: u64,
+}
+
+/// Whether a stored BOLT11 send record can be reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendVerdict {
+    /// The record is current.
+    Record,
+    /// The record can be stale while a payment is in flight. Report `Unknown`.
+    Unknown,
+}
+
+/// What this process knows about the BOLT11 sends of the node.
+///
+/// LDK Node dispatches a BOLT11 payment before it stores the Pending record.
+/// When that write fails, the call fails, but the HTLC is in flight and the
+/// store still holds the Failed record of an earlier attempt. A mint that
+/// trusts that record releases the proofs of a payment that can still settle.
+/// This state is in memory only. After a restart, every Failed record from
+/// before the start is reported as `Unknown` until no earlier send can still
+/// be in flight.
+#[derive(Debug)]
+struct Bolt11Sends {
+    /// Local Unix time when this backend started.
+    started_at: u64,
+    /// Payment hash to the local Unix time of the latest send by this process.
+    sent: HashMap<String, u64>,
+    uncertain: HashMap<String, UncertainSend>,
+}
+
+impl Bolt11Sends {
+    fn new(started_at: u64) -> Self {
+        Self {
+            started_at,
+            sent: HashMap::new(),
+            uncertain: HashMap::new(),
+        }
+    }
+
+    fn prune(&mut self, now: u64) {
+        self.sent
+            .retain(|_, sent_at| now.saturating_sub(*sent_at) < IN_FLIGHT_BOUND_SECS);
+        self.uncertain
+            .retain(|_, mark| now.saturating_sub(mark.marked_at) < IN_FLIGHT_BOUND_SECS);
+    }
+
+    fn record_send(&mut self, hash: &str, now: u64) {
+        self.prune(now);
+        self.sent.insert(hash.to_ascii_lowercase(), now);
+    }
+
+    fn mark_uncertain(&mut self, hash: &str, baseline: Option<u64>, now: u64) {
+        self.uncertain.insert(
+            hash.to_ascii_lowercase(),
+            UncertainSend {
+                baseline,
+                marked_at: now,
+            },
+        );
+    }
+
+    /// Decides whether `record`, the stored send for `hash`, can be reported.
+    ///
+    /// An uncertain send ends with a Succeeded record, with a Failed record
+    /// newer than the record before the send, or after the in-flight bound.
+    /// Until then a Failed or missing record is `Unknown`.
+    fn verdict(&mut self, hash: &str, record: Option<&Payment>, now: u64) -> SendVerdict {
+        self.prune(now);
+        let hash = hash.to_ascii_lowercase();
+        let status = record.and_then(|payment| payment_status(payment).ok());
+
+        if let Some(mark) = self.uncertain.get(&hash).copied() {
+            let current = match (record, status) {
+                (Some(_), Some(PaymentStatus::Succeeded)) => true,
+                (Some(payment), Some(PaymentStatus::Failed)) => mark
+                    .baseline
+                    .is_none_or(|baseline| payment.latest_update_timestamp > baseline),
+                _ => false,
+            };
+            if current {
+                self.uncertain.remove(&hash);
+                return SendVerdict::Record;
+            }
+            return match status {
+                Some(PaymentStatus::Pending) => SendVerdict::Record,
+                _ => SendVerdict::Unknown,
+            };
+        }
+
+        // A send of an earlier process can be in flight behind an old Failed record.
+        let failed_before_start = status == Some(PaymentStatus::Failed)
+            && !self.sent.contains_key(&hash)
+            && record.is_some_and(|payment| {
+                payment.latest_update_timestamp <= self.started_at + CLOCK_SKEW_SECS
+            })
+            && now < self.started_at + IN_FLIGHT_BOUND_SECS;
+        if failed_before_start {
+            SendVerdict::Unknown
+        } else {
+            SendVerdict::Record
+        }
+    }
+}
+
+/// True when a failed `Bolt11Send` does not prove that nothing was dispatched.
+///
+/// LDK Server reports request, authentication and Lightning errors before a
+/// dispatch. A server error (for example a failed store write) or a transport
+/// error can come after it.
+fn send_outcome_is_uncertain(error: &LdkServerError) -> bool {
+    matches!(
+        error.error_code,
+        LdkServerErrorCode::InternalServerError | LdkServerErrorCode::InternalError
+    )
+}
+
+fn unknown_payment_response(payment_identifier: &PaymentIdentifier) -> MakePaymentResponse {
+    MakePaymentResponse {
+        payment_lookup_id: payment_identifier.clone(),
+        payment_proof: None,
+        status: MeltQuoteState::Unknown,
+        total_spent: Amount::new(0, CurrencyUnit::Msat),
+    }
+}
 
 /// The LDK Server calls that the backend makes.
 ///
@@ -278,6 +417,7 @@ pub struct LdkServerBackend {
     wait_invoice_cancel_token: CancellationToken,
     wait_invoice_is_active: Arc<AtomicBool>,
     outgoing_payment_correlations: OutgoingPaymentCorrelations,
+    bolt11_sends: Arc<Mutex<Bolt11Sends>>,
     max_payment_scan_pages: u16,
     advertised_methods: Vec<AdvertisedMethod>,
 }
@@ -332,6 +472,7 @@ impl LdkServerBackend {
             config.fee_reserve,
             config.max_payment_scan_pages,
             config.advertised_methods,
+            unix_time(),
         ))
     }
 
@@ -340,6 +481,7 @@ impl LdkServerBackend {
         fee_reserve: FeeReserve,
         max_payment_scan_pages: u16,
         advertised_methods: Vec<AdvertisedMethod>,
+        started_at: u64,
     ) -> Self {
         Self {
             client,
@@ -347,8 +489,38 @@ impl LdkServerBackend {
             wait_invoice_cancel_token: CancellationToken::new(),
             wait_invoice_is_active: Arc::new(AtomicBool::new(false)),
             outgoing_payment_correlations: OutgoingPaymentCorrelator::new(),
+            bolt11_sends: Arc::new(Mutex::new(Bolt11Sends::new(started_at))),
             max_payment_scan_pages,
             advertised_methods,
+        }
+    }
+
+    /// Reports a stored BOLT11 send, or `Unknown` while it can be stale.
+    async fn reported_bolt11_send(
+        &self,
+        hash: &str,
+        payment: Option<Payment>,
+        payment_identifier: &PaymentIdentifier,
+    ) -> Result<MakePaymentResponse, payment::Error> {
+        let verdict = self
+            .bolt11_sends
+            .lock()
+            .await
+            .verdict(hash, payment.as_ref(), unix_time());
+        match (verdict, payment) {
+            (SendVerdict::Unknown, _) => {
+                tracing::warn!(
+                    "Reporting BOLT11 send {} as unknown: its stored record can be stale",
+                    hash
+                );
+                Ok(unknown_payment_response(payment_identifier))
+            }
+            (SendVerdict::Record, Some(payment)) => Self::make_payment_response_from_payment(
+                &CurrencyUnit::Msat,
+                payment_identifier.clone(),
+                &payment,
+            ),
+            (SendVerdict::Record, None) => Err(Error::PaymentNotFound.into()),
         }
     }
 
@@ -694,14 +866,24 @@ impl MintPayment for LdkServerBackend {
                 };
                 let payment_hash =
                     hex::encode(bolt11_options.bolt11.payment_hash().as_byte_array());
+                // The record before the send: a later Failed record is current
+                // only when it is newer. LDK Node uses the hash as payment ID.
+                let baseline = self
+                    .get_payment_details(&payment_hash)
+                    .await?
+                    .map(|payment| payment.latest_update_timestamp);
                 remember_outgoing_payment_context(
                     &self.outgoing_payment_correlations,
                     &payment_hash,
                     context.clone(),
                 )
                 .await;
+                self.bolt11_sends
+                    .lock()
+                    .await
+                    .record_send(&payment_hash, unix_time());
 
-                let response = self
+                let response = match self
                     .client
                     .bolt11_send(Bolt11SendRequest {
                         invoice: bolt11_options.bolt11.to_string(),
@@ -709,7 +891,24 @@ impl MintPayment for LdkServerBackend {
                         route_parameters,
                     })
                     .await
-                    .map_err(Error::from)?;
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if send_outcome_is_uncertain(&error) {
+                            tracing::warn!(
+                                "BOLT11 send {} failed after a possible dispatch: {}",
+                                payment_hash,
+                                error
+                            );
+                            self.bolt11_sends.lock().await.mark_uncertain(
+                                &payment_hash,
+                                baseline,
+                                unix_time(),
+                            );
+                        }
+                        return Err(Error::from(error).into());
+                    }
+                };
                 remember_outgoing_payment_context(
                     &self.outgoing_payment_correlations,
                     &response.payment_id,
@@ -1004,20 +1203,34 @@ impl MintPayment for LdkServerBackend {
         match payment_identifier {
             PaymentIdentifier::PaymentId(payment_id) => {
                 let payment_id = hex::encode(payment_id);
-                let payment = self
-                    .get_payment_details(&payment_id)
-                    .await?
-                    .ok_or(Error::PaymentNotFound)?;
+                let payment = self.get_payment_details(&payment_id).await?;
 
-                if payment_direction(&payment)? != PaymentDirection::Outbound {
-                    return Err(Error::InvalidPaymentDirection.into());
+                let bolt11_hash = match &payment {
+                    Some(payment) => {
+                        if payment_direction(payment)? != PaymentDirection::Outbound {
+                            return Err(Error::InvalidPaymentDirection.into());
+                        }
+                        match payment_kind(payment)? {
+                            payment_kind::Kind::Bolt11(bolt11) => Some(bolt11.hash.clone()),
+                            _ => None,
+                        }
+                    }
+                    // A BOLT11 send uses its payment hash as payment ID.
+                    None => Some(payment_id),
+                };
+
+                match (bolt11_hash, payment) {
+                    (Some(hash), payment) => {
+                        self.reported_bolt11_send(&hash, payment, payment_identifier)
+                            .await
+                    }
+                    (None, Some(payment)) => Self::make_payment_response_from_payment(
+                        &CurrencyUnit::Msat,
+                        payment_identifier.clone(),
+                        &payment,
+                    ),
+                    (None, None) => Err(Error::PaymentNotFound.into()),
                 }
-
-                Self::make_payment_response_from_payment(
-                    &CurrencyUnit::Msat,
-                    payment_identifier.clone(),
-                    &payment,
-                )
             }
             PaymentIdentifier::PaymentHash(hash) => {
                 let hash = hex::encode(hash);
@@ -1032,25 +1245,16 @@ impl MintPayment for LdkServerBackend {
                 // LDK Node uses the invoice payment hash as the payment ID of a
                 // BOLT11 send, so a direct lookup avoids a history scan.
                 let payment = match self.get_payment_details(&hash).await? {
-                    Some(payment) if is_bolt11_send(&payment) => payment,
-                    _ => {
-                        let payments = self.list_matching_payments(is_bolt11_send, false).await?;
-                        select_bolt11_payment(payments).ok_or(Error::PaymentNotFound)?
-                    }
+                    Some(payment) if is_bolt11_send(&payment) => Some(payment),
+                    _ => select_bolt11_payment(
+                        self.list_matching_payments(is_bolt11_send, false).await?,
+                    ),
                 };
 
-                Self::make_payment_response_from_payment(
-                    &CurrencyUnit::Msat,
-                    payment_identifier.clone(),
-                    &payment,
-                )
+                self.reported_bolt11_send(&hash, payment, payment_identifier)
+                    .await
             }
-            _ => Ok(MakePaymentResponse {
-                payment_lookup_id: payment_identifier.clone(),
-                payment_proof: None,
-                status: MeltQuoteState::Unknown,
-                total_spent: Amount::new(0, CurrencyUnit::Msat),
-            }),
+            _ => Ok(unknown_payment_response(payment_identifier)),
         }
     }
 }
@@ -2007,6 +2211,14 @@ mod tests {
 /// Tests that drive the backend against an in-memory LDK Server.
 #[cfg(test)]
 mod fake_server_tests {
+    use std::collections::VecDeque;
+    use std::str::FromStr;
+
+    use bitcoin::hashes::sha256;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use cdk_common::lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use cdk_common::payment::Bolt11OutgoingPaymentOptions;
+    use cdk_common::Bolt11Invoice;
     use ldk_server_client::error::LdkServerErrorCode;
     use ldk_server_client::ldk_server_grpc::types::{Bolt11, Bolt12Offer, PaymentKind};
 
@@ -2015,11 +2227,20 @@ mod fake_server_tests {
     /// LDK Node lists 50 payments on each page.
     const PAGE_SIZE: usize = 50;
 
+    /// What the fake node does on the next `Bolt11Send`.
+    enum FakeSend {
+        /// The node dispatches the payment and stores this record.
+        Stores(Box<Payment>),
+        /// The call fails with this code. The store keeps its old record.
+        Fails(LdkServerErrorCode),
+    }
+
     #[derive(Default)]
     struct FakeState {
         /// Newest first, as LDK Node lists them.
         payments: Vec<Payment>,
         list_calls: usize,
+        sends: VecDeque<FakeSend>,
     }
 
     #[derive(Default)]
@@ -2036,6 +2257,22 @@ mod fake_server_tests {
 
         fn list_calls(&self) -> usize {
             self.state.lock().unwrap().list_calls
+        }
+
+        /// An update keeps the list position of a record; a new record comes first.
+        fn upsert(&self, payment: Payment) {
+            let mut state = self.state.lock().unwrap();
+            match state
+                .payments
+                .iter_mut()
+                .find(|existing| existing.payment_id == payment.payment_id)
+            {
+                Some(existing) => *existing = payment,
+                None => state.payments.insert(0, payment),
+            }
+        }
+        fn script_send(&self, send: FakeSend) {
+            self.state.lock().unwrap().sends.push_back(send);
         }
     }
 
@@ -2073,7 +2310,16 @@ mod fake_server_tests {
             &self,
             _request: Bolt11SendRequest,
         ) -> Result<Bolt11SendResponse, LdkServerError> {
-            unsupported()
+            let send = self.state.lock().unwrap().sends.pop_front();
+            match send {
+                Some(FakeSend::Stores(payment)) => {
+                    let payment_id = payment.payment_id.clone();
+                    self.upsert(*payment);
+                    Ok(Bolt11SendResponse { payment_id })
+                }
+                Some(FakeSend::Fails(code)) => Err(LdkServerError::new(code, "fake send failure")),
+                None => unsupported(),
+            }
         }
 
         async fn bolt12_send(
@@ -2119,6 +2365,14 @@ mod fake_server_tests {
     }
 
     fn backend(server: Arc<FakeLdkServer>, max_payment_scan_pages: u16) -> LdkServerBackend {
+        backend_started_at(server, max_payment_scan_pages, unix_time())
+    }
+
+    fn backend_started_at(
+        server: Arc<FakeLdkServer>,
+        max_payment_scan_pages: u16,
+        started_at: u64,
+    ) -> LdkServerBackend {
         LdkServerBackend::with_api(
             server,
             FeeReserve {
@@ -2127,6 +2381,7 @@ mod fake_server_tests {
             },
             max_payment_scan_pages,
             AdvertisedMethod::ALL.to_vec(),
+            started_at,
         )
     }
 
@@ -2278,5 +2533,232 @@ mod fake_server_tests {
             .expect("the default cap must cover a long payment history");
 
         assert_eq!(found.len(), 1);
+    }
+    // ------------------------------------------------ outgoing BOLT11 sends
+
+    fn invoice(hash: &str) -> Bolt11Invoice {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&[41; 32]).unwrap();
+        InvoiceBuilder::new(Currency::Regtest)
+            .description("fake".to_string())
+            .payment_hash(sha256::Hash::from_byte_array(hash_bytes(hash)))
+            .payment_secret(PaymentSecret([42; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144)
+            .amount_milli_satoshis(1_000_000)
+            .build_signed(|message| secp.sign_ecdsa_recoverable(message, &key))
+            .unwrap()
+    }
+
+    fn send_options(hash: &str, quote_id: &QuoteId) -> OutgoingPaymentOptions {
+        OutgoingPaymentOptions::Bolt11(Box::new(Bolt11OutgoingPaymentOptions {
+            bolt11: Bolt11Invoice::from_str(&invoice(hash).to_string()).unwrap(),
+            max_fee_amount: None,
+            timeout_secs: Some(1),
+            melt_options: None,
+            quote_id: quote_id.clone(),
+        }))
+    }
+
+    /// The record of a BOLT11 send. LDK Node uses the hash as its payment ID.
+    fn send_record(hash: &str, status: PaymentStatus, latest_update_timestamp: u64) -> Payment {
+        bolt11_payment(
+            hash.to_string(),
+            hash.to_string(),
+            PaymentDirection::Outbound,
+            status,
+            latest_update_timestamp,
+        )
+    }
+
+    async fn statuses(backend: &LdkServerBackend, hash: &str) -> (MeltQuoteState, MeltQuoteState) {
+        let by_hash = backend
+            .check_outgoing_payment(&PaymentIdentifier::PaymentHash(hash_bytes(hash)))
+            .await
+            .expect("check by hash");
+        let by_id = backend
+            .check_outgoing_payment(&PaymentIdentifier::PaymentId(hash_bytes(hash)))
+            .await
+            .expect("check by payment ID");
+        (by_hash.status, by_id.status)
+    }
+
+    /// Attempt 1 failed. Attempt 2 dispatches, but the call fails, for example
+    /// because the node cannot store its Pending record.
+    async fn uncertain_second_attempt(
+        code: LdkServerErrorCode,
+    ) -> (Arc<FakeLdkServer>, LdkServerBackend, String) {
+        let hash = hash_hex(6_000_000);
+        let server =
+            FakeLdkServer::with_payments(vec![send_record(&hash, PaymentStatus::Failed, 100)]);
+        let backend = backend(server.clone(), 32);
+        server.script_send(FakeSend::Fails(code));
+        backend
+            .make_payment(&CurrencyUnit::Msat, send_options(&hash, &QuoteId::new()))
+            .await
+            .expect_err("the fake send fails");
+        (server, backend, hash)
+    }
+
+    #[tokio::test]
+    async fn a_stale_failed_record_is_unknown_after_a_store_error() {
+        let (_, backend, hash) =
+            uncertain_second_attempt(LdkServerErrorCode::InternalServerError).await;
+        assert_eq!(
+            statuses(&backend, &hash).await,
+            (MeltQuoteState::Unknown, MeltQuoteState::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_failed_record_is_unknown_after_a_transport_error() {
+        let (_, backend, hash) = uncertain_second_attempt(LdkServerErrorCode::InternalError).await;
+        assert_eq!(
+            statuses(&backend, &hash).await,
+            (MeltQuoteState::Unknown, MeltQuoteState::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newer_failed_record_ends_the_uncertainty() {
+        let (server, backend, hash) =
+            uncertain_second_attempt(LdkServerErrorCode::InternalServerError).await;
+        server.upsert(send_record(&hash, PaymentStatus::Failed, 101));
+        assert_eq!(
+            statuses(&backend, &hash).await,
+            (MeltQuoteState::Failed, MeltQuoteState::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_succeeded_record_ends_the_uncertainty() {
+        let (server, backend, hash) =
+            uncertain_second_attempt(LdkServerErrorCode::InternalServerError).await;
+        server.upsert(send_record(&hash, PaymentStatus::Succeeded, 100));
+        assert_eq!(
+            statuses(&backend, &hash).await,
+            (MeltQuoteState::Paid, MeltQuoteState::Paid)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lightning_error_leaves_the_failed_record_authoritative() {
+        let (_, backend, hash) = uncertain_second_attempt(LdkServerErrorCode::LightningError).await;
+        assert_eq!(
+            statuses(&backend, &hash).await,
+            (MeltQuoteState::Failed, MeltQuoteState::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_record_from_before_this_backend_is_unknown() {
+        // A send of an earlier process can still be in flight behind this record.
+        let hash = hash_hex(6_000_001);
+        let server = FakeLdkServer::with_payments(vec![send_record(
+            &hash,
+            PaymentStatus::Failed,
+            unix_time() - 3_600,
+        )]);
+        assert_eq!(
+            statuses(&backend(server, 32), &hash).await,
+            (MeltQuoteState::Unknown, MeltQuoteState::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_record_from_before_this_backend_is_current_after_the_bound() {
+        let hash = hash_hex(6_000_002);
+        let started_at = unix_time() - IN_FLIGHT_BOUND_SECS - 1;
+        let server = FakeLdkServer::with_payments(vec![send_record(
+            &hash,
+            PaymentStatus::Failed,
+            started_at - 3_600,
+        )]);
+        assert_eq!(
+            statuses(&backend_started_at(server, 32, started_at), &hash).await,
+            (MeltQuoteState::Failed, MeltQuoteState::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_record_written_after_the_start_is_current() {
+        let hash = hash_hex(6_000_003);
+        let started_at = unix_time() - 600;
+        let server = FakeLdkServer::with_payments(vec![send_record(
+            &hash,
+            PaymentStatus::Failed,
+            started_at + CLOCK_SKEW_SECS + 1,
+        )]);
+        assert_eq!(
+            statuses(&backend_started_at(server, 32, started_at), &hash).await,
+            (MeltQuoteState::Failed, MeltQuoteState::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncertain_send_without_a_record_is_unknown() {
+        let hash = hash_hex(6_000_004);
+        let server = FakeLdkServer::with_payments(vec![]);
+        let backend = backend(server, 32);
+        backend
+            .bolt11_sends
+            .lock()
+            .await
+            .record_send(&hash, unix_time());
+        assert!(backend
+            .check_outgoing_payment(&PaymentIdentifier::PaymentHash(hash_bytes(&hash)))
+            .await
+            .is_err());
+        backend
+            .bolt11_sends
+            .lock()
+            .await
+            .mark_uncertain(&hash, None, unix_time());
+        assert_eq!(
+            statuses(&backend, &hash).await,
+            (MeltQuoteState::Unknown, MeltQuoteState::Unknown)
+        );
+    }
+
+    #[test]
+    fn an_uncertain_send_ends_after_the_in_flight_bound() {
+        let hash = hash_hex(6_000_005);
+        let stale = send_record(&hash, PaymentStatus::Failed, 100);
+        let mut sends = Bolt11Sends::new(0);
+        sends.record_send(&hash, 1_000);
+        sends.mark_uncertain(&hash, Some(100), 1_000);
+
+        assert_eq!(
+            sends.verdict(&hash, Some(&stale), 1_000 + IN_FLIGHT_BOUND_SECS - 1),
+            SendVerdict::Unknown
+        );
+        assert_eq!(
+            sends.verdict(&hash, Some(&stale), 1_000 + IN_FLIGHT_BOUND_SECS),
+            SendVerdict::Record
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dispatched_second_attempt_reports_its_new_record() {
+        let hash = hash_hex(6_000_006);
+        let server =
+            FakeLdkServer::with_payments(vec![send_record(&hash, PaymentStatus::Failed, 100)]);
+        let backend = backend(server.clone(), 32);
+        server.script_send(FakeSend::Stores(Box::new(send_record(
+            &hash,
+            PaymentStatus::Pending,
+            101,
+        ))));
+
+        let started = backend
+            .make_payment(&CurrencyUnit::Msat, send_options(&hash, &QuoteId::new()))
+            .await
+            .expect("attempt 2 starts");
+
+        assert_eq!(started.status, MeltQuoteState::Pending);
+        assert_eq!(
+            statuses(&backend, &hash).await,
+            (MeltQuoteState::Pending, MeltQuoteState::Pending)
+        );
     }
 }
