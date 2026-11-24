@@ -15,8 +15,10 @@ tls_client_ca_path = "certs/ca.pem"
 [ldk]
 # gRPC address of the LDK Server node, without scheme
 address = "127.0.0.1:3536"
-# HMAC API key (64-char hex)
-api_key = "your-api-key-hex-here"
+# Private hex-encoded v2 macaroon. Create one for this processor only:
+#   ldk-server-cli create-macaroon cdk-processor --permissions \
+#     node:read invoices:create payments:read payments:send events:read
+macaroon = "your-macaroon-hex-here"
 # PEM certificate to pin for the LDK Server connection
 tls_cert_path = "certs/ldk-server.crt"
 

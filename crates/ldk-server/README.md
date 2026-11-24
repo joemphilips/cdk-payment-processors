@@ -57,7 +57,7 @@ values.
 | `tls_key_path` | `TLS_KEY_PATH` | `certs/server.key` |
 | `tls_client_ca_path` | `TLS_CLIENT_CA_PATH` | `certs/ca.pem` |
 | `ldk.address` | `LDK_ADDRESS` | Required |
-| `ldk.api_key` | `LDK_API_KEY` | Required |
+| `ldk.macaroon` | `LDK_MACAROON` | Required |
 | `ldk.tls_cert_path` | `LDK_TLS_CERT_PATH` | Required |
 | `ldk.fee_reserve_min_sat` | `LDK_FEE_RESERVE_MIN_SAT` | `2` |
 | `ldk.fee_reserve_percent` | `LDK_FEE_RESERVE_PERCENT` | `0.01` |
@@ -66,6 +66,22 @@ values.
 
 Boolean environment variables accept only the literal values `true` and
 `false`.
+
+### LDK Server credential
+
+LDK Server authenticates each request with a macaroon. The processor needs only
+these permissions: `node:read`, `invoices:create`, `payments:read`,
+`payments:send` and `events:read`. Create a separate macaroon for the
+processor, so that you can revoke it alone:
+
+```bash
+ldk-server-cli create-macaroon cdk-processor \
+  --permissions node:read invoices:create payments:read payments:send events:read
+```
+
+Put the returned `token` in `ldk.macaroon`. Keep it private. The client binds a
+copy of it to each request, so the clocks of the processor and LDK Server must
+agree within 60 seconds.
 
 With TLS enabled, `tls_client_ca_path` must contain the CA certificate that
 signed the mint's `client.pem`; clients without a trusted certificate are

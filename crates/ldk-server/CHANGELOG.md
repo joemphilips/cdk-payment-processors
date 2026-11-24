@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Updated all CDK dependencies from `0.18.1` to `0.18.2`.
+- Ported the backend to LDK Server `d7e7a2e`: macaroon authentication replaces
+  the HMAC API key (`ldk.macaroon` / `LDK_MACAROON` replaces `ldk.api_key` /
+  `LDK_API_KEY`), page tokens are strings, payments carry `payment_id`, and the
+  new channel and splice events are ignored. The regtest suite gives the
+  processor a macaroon with only the permissions that it needs.
 
 ### Fixed
 
