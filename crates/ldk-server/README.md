@@ -72,7 +72,8 @@ values.
 | `tls_key_path` | `TLS_KEY_PATH` | `certs/server.key` |
 | `tls_client_ca_path` | `TLS_CLIENT_CA_PATH` | `certs/ca.pem` |
 | `ldk.address` | `LDK_ADDRESS` | Required |
-| `ldk.macaroon` | `LDK_MACAROON` | Required |
+| `ldk.macaroon` | `LDK_MACAROON` | This or `ldk.macaroon_path` |
+| `ldk.macaroon_path` | `LDK_MACAROON_PATH` | This or `ldk.macaroon` |
 | `ldk.tls_cert_path` | `LDK_TLS_CERT_PATH` | Required |
 | `ldk.fee_reserve_min_sat` | `LDK_FEE_RESERVE_MIN_SAT` | `2` |
 | `ldk.fee_reserve_percent` | `LDK_FEE_RESERVE_PERCENT` | `0.01` |
@@ -94,7 +95,10 @@ ldk-server-cli create-macaroon cdk-processor \
   --permissions node:read invoices:create payments:read payments:send events:read
 ```
 
-Put the returned `token` in `ldk.macaroon`. Keep it private. The client binds a
+Put the returned `token` in a file that only the processor can read, and set
+`ldk.macaroon_path` to it. `ldk.macaroon` takes the token inline instead. Set
+one of them, not both. The processor never prints or serializes the token.
+Keep it private. The client binds a
 copy of it to each request, so the clocks of the processor and LDK Server must
 agree within 60 seconds.
 

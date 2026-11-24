@@ -19,6 +19,8 @@ address = "127.0.0.1:3536"
 #   ldk-server-cli create-macaroon cdk-processor --permissions \
 #     node:read invoices:create payments:read payments:send events:read
 macaroon = "your-macaroon-hex-here"
+# Or read the token from a file instead (set one of the two, not both):
+# macaroon_path = "/run/secrets/ldk-server.macaroon"
 # PEM certificate to pin for the LDK Server connection
 tls_cert_path = "certs/ldk-server.crt"
 

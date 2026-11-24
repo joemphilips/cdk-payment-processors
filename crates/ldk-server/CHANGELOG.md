@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LDK_API_KEY`), page tokens are strings, payments carry `payment_id`, and the
   new channel and splice events are ignored. The regtest suite gives the
   processor a macaroon with only the permissions that it needs.
+- `ldk.macaroon_path` (`LDK_MACAROON_PATH`) reads the macaroon from a file.
+  It is mutually exclusive with `ldk.macaroon`. The debug output and the
+  serialized configuration no longer contain the macaroon.
 - bitCaster fork only: a `[patch.crates-io]` section builds the crate against
   the bitCaster CDK fork `fee0f9d4`. Remove it before an upstream pull request.
 
