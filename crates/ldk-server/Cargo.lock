@@ -1258,7 +1258,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2121,7 +2121,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-client"
 version = "0.1.0"
-source = "git+https://github.com/joemphilips/ldk-server?rev=d7e7a2e708664af922c53c786ad6a5df622f5dd8#d7e7a2e708664af922c53c786ad6a5df622f5dd8"
+source = "git+https://github.com/joemphilips/ldk-server?rev=95b2011910c2465a2c5620c65fbe0377c47f7a93#95b2011910c2465a2c5620c65fbe0377c47f7a93"
 dependencies = [
  "hyper",
  "ldk-server-grpc",
@@ -2133,7 +2133,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-grpc"
 version = "0.1.0"
-source = "git+https://github.com/joemphilips/ldk-server?rev=d7e7a2e708664af922c53c786ad6a5df622f5dd8#d7e7a2e708664af922c53c786ad6a5df622f5dd8"
+source = "git+https://github.com/joemphilips/ldk-server?rev=95b2011910c2465a2c5620c65fbe0377c47f7a93#95b2011910c2465a2c5620c65fbe0377c47f7a93"
 dependencies = [
  "bytes",
  "http",
@@ -2146,7 +2146,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-macaroons"
 version = "0.1.0"
-source = "git+https://github.com/joemphilips/ldk-server?rev=d7e7a2e708664af922c53c786ad6a5df622f5dd8#d7e7a2e708664af922c53c786ad6a5df622f5dd8"
+source = "git+https://github.com/joemphilips/ldk-server?rev=95b2011910c2465a2c5620c65fbe0377c47f7a93#95b2011910c2465a2c5620c65fbe0377c47f7a93"
 dependencies = [
  "bitcoin_hashes 0.14.101",
  "hex-conservative 0.2.2",
@@ -2378,7 +2378,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2787,7 +2787,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools",
  "log",
  "multimap",
@@ -2919,7 +2919,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3229,7 +3229,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3770,10 +3770,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

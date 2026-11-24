@@ -10,14 +10,24 @@ starts. A status check by payment hash reads the BOLT11 send directly, because
 LDK Node uses the payment hash as the payment ID of a BOLT11 send.
 
 LDK Node dispatches a BOLT11 payment before it stores its Pending record. When
-`Bolt11Send` fails with a server or transport error, the payment can be in
-flight while the store still holds the Failed record of an earlier attempt.
-The processor then reports `Unknown` for that payment until a Succeeded
-record, a newer Failed record, or 14 days (twice the 1,008-block CLTV limit).
-The processor keeps this state in memory. After a restart, it reports a
-Failed BOLT11 record from before the start as `Unknown` for 14 days, unless it
-sent that payment again. A mint keeps such a melt pending; it does not release
-the proofs.
+`Bolt11Send` fails after the request can have reached LDK Server (a server
+error other than "Node is not running", or a transport error other than a
+failed connection), the payment can be in flight while the store still holds
+the Failed record of an earlier attempt. A `DuplicatePayment` error behind a
+Failed or missing record also means that LDK still tracks a send. The
+processor then marks the payment hash and reports `Unknown` for it until a
+Succeeded record, a Failed record newer than the record before the send, or 14
+days after the mark (twice the 1,008-block CLTV limit). A mint keeps such a
+melt pending; it does not release the proofs.
+
+The marks are in the file at `ldk.state_path`, so they survive a restart. The
+processor writes the file atomically before it reports the failed send. It
+does not start when the file exists but cannot be read or parsed. Then check
+each payment hash in the file with `ldk-server-cli get-payment-details <hash>`.
+When each one has a Succeeded record, or a Failed record newer than the
+baseline in its line, or the mark (the last number, a Unix time) is more than
+14 days old, move the file away and start the processor. Otherwise repair the
+file, or wait until the 14 days pass.
 When a payment initially returns as pending, a later success event finalizes
 the melt and a permanent failure event allows CDK to compensate it. Terminal
 events that arrive before the quote ID is known are buffered briefly and
@@ -74,6 +84,7 @@ values.
 | `ldk.address` | `LDK_ADDRESS` | Required |
 | `ldk.macaroon` | `LDK_MACAROON` | This or `ldk.macaroon_path` |
 | `ldk.macaroon_path` | `LDK_MACAROON_PATH` | This or `ldk.macaroon` |
+| `ldk.state_path` | `LDK_STATE_PATH` | Required |
 | `ldk.tls_cert_path` | `LDK_TLS_CERT_PATH` | Required |
 | `ldk.fee_reserve_min_sat` | `LDK_FEE_RESERVE_MIN_SAT` | `2` |
 | `ldk.fee_reserve_percent` | `LDK_FEE_RESERVE_PERCENT` | `0.01` |

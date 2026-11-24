@@ -53,7 +53,7 @@ use tokio::time::Instant;
 // Keep in sync with the `ldk-server-client` rev pinned in Cargo.toml so the
 // daemon under test always speaks the protocol the client was generated from.
 const LDK_SERVER_REPO: &str = "https://github.com/joemphilips/ldk-server";
-const LDK_SERVER_REV: &str = "d7e7a2e708664af922c53c786ad6a5df622f5dd8";
+const LDK_SERVER_REV: &str = "95b2011910c2465a2c5620c65fbe0377c47f7a93";
 /// The only LDK Server permissions the processor needs.
 const PROCESSOR_PERMISSIONS: [&str; 5] = [
     "node:read",
@@ -477,6 +477,7 @@ fn backend_config(node: &LdkNode) -> BackendConfig {
         },
         max_payment_scan_pages: 32,
         advertised_methods: AdvertisedMethod::ALL.to_vec(),
+        state_path: None,
     }
 }
 
@@ -556,6 +557,11 @@ impl ProcessorProcess {
             .env("ALLOW_INSECURE", "true")
             .env("LDK_ADDRESS", format!("127.0.0.1:{}", node.grpc_port))
             .env("LDK_MACAROON", &node.processor_macaroon)
+            // A restart on the same port keeps the uncertain sends.
+            .env(
+                "LDK_STATE_PATH",
+                log_dir.join(format!("processor-state-{port}")),
+            )
             .env("LDK_TLS_CERT_PATH", &node.tls_cert_path)
             .env("RUST_LOG", "debug")
             .stdout(stdout)

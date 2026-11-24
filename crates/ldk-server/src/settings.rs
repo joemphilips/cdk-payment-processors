@@ -108,6 +108,9 @@ pub struct BackendConfig {
     /// File that holds the macaroon. Set this or `macaroon`, not both.
     #[serde(default)]
     pub macaroon_path: Option<String>,
+    /// File that keeps the uncertain BOLT11 sends across restarts. Required.
+    #[serde(default)]
+    pub state_path: Option<String>,
     /// Path to the PEM TLS certificate to pin for the LDK Server connection.
     pub tls_cert_path: String,
     /// Minimum absolute fee reserve for melt quotes, in satoshis.
@@ -138,6 +141,7 @@ impl Default for BackendConfig {
             address: String::new(),
             macaroon: None,
             macaroon_path: None,
+            state_path: None,
             tls_cert_path: String::new(),
             fee_reserve_min_sat: default_fee_reserve_min_sat(),
             fee_reserve_percent: default_fee_reserve_percent(),
@@ -153,6 +157,7 @@ impl fmt::Debug for BackendConfig {
             .field("address", &self.address)
             .field("macaroon", &self.macaroon.as_ref().map(|_| "[REDACTED]"))
             .field("macaroon_path", &self.macaroon_path)
+            .field("state_path", &self.state_path)
             .field("tls_cert_path", &self.tls_cert_path)
             .field("fee_reserve_min_sat", &self.fee_reserve_min_sat)
             .field("fee_reserve_percent", &self.fee_reserve_percent)
@@ -277,17 +282,28 @@ impl Config {
     /// Load from config.toml (if present) and environment variables.
     /// Environment variables override file values.
     pub fn load() -> Result<Self> {
-        let cfg = extract_config(config_figment())?;
-        anyhow::ensure!(!cfg.ldk.address.is_empty(), "ldk.address is required");
-        cfg.ldk.macaroon_token()?;
-        anyhow::ensure!(
-            !cfg.ldk.tls_cert_path.is_empty(),
-            "ldk.tls_cert_path is required"
-        );
-        // Fail at startup rather than silently advertising the wrong set.
-        cfg.ldk.advertised_methods()?;
-        Ok(cfg)
+        validate(extract_config(config_figment())?)
     }
+}
+
+/// Fail at startup on a configuration that cannot serve safely.
+fn validate(cfg: Config) -> Result<Config> {
+    anyhow::ensure!(!cfg.ldk.address.is_empty(), "ldk.address is required");
+    cfg.ldk.macaroon_token()?;
+    anyhow::ensure!(
+        cfg.ldk
+            .state_path
+            .as_deref()
+            .is_some_and(|path| !path.is_empty()),
+        "ldk.state_path is required: the processor keeps uncertain BOLT11 sends there"
+    );
+    anyhow::ensure!(
+        !cfg.ldk.tls_cert_path.is_empty(),
+        "ldk.tls_cert_path is required"
+    );
+    // Fail at startup rather than silently advertising the wrong set.
+    cfg.ldk.advertised_methods()?;
+    Ok(cfg)
 }
 
 fn config_figment() -> Figment {
@@ -423,6 +439,22 @@ mod tests {
         .unwrap();
         let error = config.ldk.macaroon_token().unwrap_err();
         assert!(error.to_string().contains("not both"), "{error}");
+    }
+
+    #[test]
+    fn a_start_without_a_state_path_is_refused() {
+        let without = parse(INLINE).unwrap();
+        let error = validate(without).unwrap_err();
+        assert!(error.to_string().contains("ldk.state_path"), "{error}");
+
+        let with = parse(&format!(
+            "{INLINE}state_path = \"/var/lib/processor/state\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            validate(with).unwrap().ldk.state_path.as_deref(),
+            Some("/var/lib/processor/state")
+        );
     }
 
     #[test]

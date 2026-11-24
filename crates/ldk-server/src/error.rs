@@ -72,6 +72,10 @@ pub enum Error {
         max_pages: u16,
     },
 
+    /// The state file of uncertain sends cannot be read or written.
+    #[error("Payment state file error: {0}")]
+    StateFile(String),
+
     /// Hex decode error.
     #[error("Hex decode error: {0}")]
     HexDecode(#[from] cdk_common::util::hex::Error),

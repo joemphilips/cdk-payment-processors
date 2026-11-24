@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
         },
         max_payment_scan_pages: cfg.ldk.max_payment_scan_pages,
         advertised_methods: cfg.ldk.advertised_methods()?,
+        state_path: cfg.ldk.state_path.clone().map(std::path::PathBuf::from),
     };
     let backend = Arc::new(LdkServerBackend::new(backend_cfg)?);
 
