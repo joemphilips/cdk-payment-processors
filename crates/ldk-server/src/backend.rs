@@ -58,6 +58,9 @@ const ROUTE_DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF: u32 = 2;
 struct OutgoingPaymentContext {
     quote_id: QuoteId,
     unit: CurrencyUnit,
+    /// `latest_update_timestamp` of the stored record before this attempt. A
+    /// failure event that is not newer belongs to an earlier attempt.
+    baseline: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -860,10 +863,6 @@ impl MintPayment for LdkServerBackend {
                 let amount_msat = bolt11_amount_msat_for_send(&bolt11_options)?;
                 let route_parameters =
                     route_parameters_from_max_fee(bolt11_options.max_fee_amount.clone())?;
-                let context = OutgoingPaymentContext {
-                    quote_id: bolt11_options.quote_id.clone(),
-                    unit: unit.clone(),
-                };
                 let payment_hash =
                     hex::encode(bolt11_options.bolt11.payment_hash().as_byte_array());
                 // The record before the send: a later Failed record is current
@@ -872,9 +871,14 @@ impl MintPayment for LdkServerBackend {
                     .get_payment_details(&payment_hash)
                     .await?
                     .map(|payment| payment.latest_update_timestamp);
-                remember_outgoing_payment_context(
+                let context = OutgoingPaymentContext {
+                    quote_id: bolt11_options.quote_id.clone(),
+                    unit: unit.clone(),
+                    baseline,
+                };
+                begin_outgoing_attempt(
                     &self.outgoing_payment_correlations,
-                    &payment_hash,
+                    vec![normalize_payment_correlation_key(&payment_hash)],
                     context.clone(),
                 )
                 .await;
@@ -946,10 +950,19 @@ impl MintPayment for LdkServerBackend {
                 let amount_msat = bolt12_amount_msat_for_send(&bolt12_options)?;
                 let route_parameters =
                     route_parameters_from_max_fee(bolt12_options.max_fee_amount.clone())?;
+                // A BOLT12 send gets a new payment ID, so no stored record
+                // of an earlier attempt shares its key.
                 let context = OutgoingPaymentContext {
                     quote_id: bolt12_options.quote_id.clone(),
                     unit: unit.clone(),
+                    baseline: None,
                 };
+                begin_outgoing_attempt(
+                    &self.outgoing_payment_correlations,
+                    Vec::new(),
+                    context.clone(),
+                )
+                .await;
                 let response = self
                     .client
                     .bolt12_send(Bolt12SendRequest {
@@ -1335,6 +1348,14 @@ async fn remember_outgoing_payment_context_keys(
                 .unmatched
                 .remove(index)
                 .expect("unmatched outgoing payment index exists");
+            if is_stale_failure(&context, &unmatched.payment, unmatched.outcome) {
+                tracing::debug!(
+                    "Dropping a failure of an earlier attempt of {}",
+                    unmatched.payment.payment_id
+                );
+                insert_outgoing_context_keys(&mut state, &keys, context);
+                return;
+            }
             match map_outgoing_payment_event(&context, &unmatched.payment, unmatched.outcome) {
                 Ok(event) => {
                     finalize_quote(&mut state, &context.quote_id);
@@ -1359,6 +1380,36 @@ async fn remember_outgoing_payment_context_keys(
     }
 }
 
+/// Starts a payment attempt of a melt quote.
+///
+/// A quote can be melted again after a failed attempt. The new attempt drops
+/// the finalized mark, the keys and the buffered events of earlier attempts,
+/// so that only events of this attempt reach the quote.
+async fn begin_outgoing_attempt(
+    correlations: &OutgoingPaymentCorrelations,
+    keys: Vec<String>,
+    context: OutgoingPaymentContext,
+) {
+    let mut state = correlations.state.lock().await;
+    expire_correlator_state(&mut state, Instant::now());
+    state.finalized.remove(&context.quote_id);
+    remove_quote_keys(&mut state, &context.quote_id);
+    drop_unmatched_for_keys(&mut state, &keys);
+    insert_outgoing_context_keys(&mut state, &keys, context);
+}
+
+/// True for a failure event that belongs to an earlier attempt of the hash.
+fn is_stale_failure(
+    context: &OutgoingPaymentContext,
+    payment: &Payment,
+    outcome: OutgoingPaymentOutcome,
+) -> bool {
+    outcome == OutgoingPaymentOutcome::Failed
+        && context
+            .baseline
+            .is_some_and(|baseline| payment.latest_update_timestamp <= baseline)
+}
+
 async fn remove_outgoing_payment_context(
     correlations: &OutgoingPaymentCorrelations,
     quote_id: &QuoteId,
@@ -1380,6 +1431,14 @@ async fn take_correlated_outgoing_event(
         .iter()
         .find_map(|key| state.by_key.get(key).map(|pending| pending.context.clone()))
     {
+        if is_stale_failure(&context, &payment, outcome) {
+            tracing::debug!(
+                "Dropping a failure of an earlier attempt of {} for quote {}",
+                payment.payment_id,
+                context.quote_id
+            );
+            return Ok(None);
+        }
         finalize_quote(&mut state, &context.quote_id);
         return map_outgoing_payment_event(&context, &payment, outcome).map(Some);
     }
@@ -1899,6 +1958,7 @@ mod tests {
             OutgoingPaymentContext {
                 quote_id: quote_id.clone(),
                 unit: CurrencyUnit::Sat,
+                baseline: None,
             },
         )
         .await;
@@ -1946,6 +2006,7 @@ mod tests {
             OutgoingPaymentContext {
                 quote_id: quote_id.clone(),
                 unit: CurrencyUnit::Msat,
+                baseline: None,
             },
         )
         .await;
@@ -1994,6 +2055,7 @@ mod tests {
             OutgoingPaymentContext {
                 quote_id: quote_id.clone(),
                 unit: CurrencyUnit::Msat,
+                baseline: None,
             },
         )
         .await;
@@ -2063,6 +2125,7 @@ mod tests {
             OutgoingPaymentContext {
                 quote_id: quote_id.clone(),
                 unit: CurrencyUnit::Sat,
+                baseline: None,
             },
         )
         .await;
@@ -2220,6 +2283,9 @@ mod fake_server_tests {
     use cdk_common::payment::Bolt11OutgoingPaymentOptions;
     use cdk_common::Bolt11Invoice;
     use ldk_server_client::error::LdkServerErrorCode;
+    use ldk_server_client::ldk_server_grpc::events::{
+        PaymentFailed as LdkPaymentFailed, PaymentSuccessful as LdkPaymentSuccessful,
+    };
     use ldk_server_client::ldk_server_grpc::types::{Bolt11, Bolt12Offer, PaymentKind};
 
     use super::*;
@@ -2760,5 +2826,130 @@ mod fake_server_tests {
             statuses(&backend, &hash).await,
             (MeltQuoteState::Pending, MeltQuoteState::Pending)
         );
+    }
+    // ------------------------------------------------ melt events
+
+    fn failed_envelope(payment: Payment) -> EventEnvelope {
+        EventEnvelope {
+            event: Some(event_envelope::Event::PaymentFailed(LdkPaymentFailed {
+                payment_id: payment.payment_id.clone(),
+                payment: Some(payment),
+                reason: None,
+            })),
+        }
+    }
+
+    fn successful_envelope(payment: Payment) -> EventEnvelope {
+        EventEnvelope {
+            event: Some(event_envelope::Event::PaymentSuccessful(
+                LdkPaymentSuccessful {
+                    payment_id: payment.payment_id.clone(),
+                    payment: Some(payment),
+                    payment_preimage: None,
+                    bolt12_invoice: None,
+                },
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quote_melted_again_after_a_failure_gets_its_success_event() {
+        let hash = hash_hex(7_000_000);
+        let quote_id = QuoteId::new();
+        let server = FakeLdkServer::with_payments(vec![]);
+        let backend = backend(server.clone(), 32);
+        let correlations = backend.outgoing_payment_correlations.clone();
+
+        server.script_send(FakeSend::Stores(Box::new(send_record(
+            &hash,
+            PaymentStatus::Pending,
+            100,
+        ))));
+        let first = backend
+            .make_payment(&CurrencyUnit::Msat, send_options(&hash, &quote_id))
+            .await
+            .expect("attempt 1 starts");
+        assert_eq!(first.status, MeltQuoteState::Pending);
+        let failed = send_record(&hash, PaymentStatus::Failed, 101);
+        server.upsert(failed.clone());
+        let event = LdkServerBackend::event_from_envelope(failed_envelope(failed), &correlations)
+            .await
+            .unwrap();
+        assert!(matches!(event, Some(Event::PaymentFailed { .. })));
+
+        server.script_send(FakeSend::Stores(Box::new(send_record(
+            &hash,
+            PaymentStatus::Pending,
+            102,
+        ))));
+        let second = backend
+            .make_payment(&CurrencyUnit::Msat, send_options(&hash, &quote_id))
+            .await
+            .expect("attempt 2 starts");
+        assert_eq!(second.status, MeltQuoteState::Pending);
+        let succeeded = send_record(&hash, PaymentStatus::Succeeded, 103);
+        server.upsert(succeeded.clone());
+        let event =
+            LdkServerBackend::event_from_envelope(successful_envelope(succeeded), &correlations)
+                .await
+                .unwrap();
+
+        match event {
+            Some(Event::PaymentSuccessful {
+                quote_id: event_quote,
+                details,
+            }) => {
+                assert_eq!(event_quote, quote_id);
+                assert_eq!(
+                    details.payment_lookup_id,
+                    PaymentIdentifier::PaymentHash(hash_bytes(&hash))
+                );
+            }
+            other => panic!("attempt 2 must emit its success event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_failure_of_an_earlier_attempt_is_not_reported() {
+        let hash = hash_hex(7_000_001);
+        let quote_id = QuoteId::new();
+        let attempt_one_failed = send_record(&hash, PaymentStatus::Failed, 101);
+        let server = FakeLdkServer::with_payments(vec![attempt_one_failed.clone()]);
+        let backend = backend(server.clone(), 32);
+        let correlations = backend.outgoing_payment_correlations.clone();
+
+        server.script_send(FakeSend::Stores(Box::new(send_record(
+            &hash,
+            PaymentStatus::Pending,
+            102,
+        ))));
+        backend
+            .make_payment(&CurrencyUnit::Msat, send_options(&hash, &quote_id))
+            .await
+            .expect("attempt 2 starts");
+
+        // The failure event of attempt 1 arrives after attempt 2 starts.
+        let late = LdkServerBackend::event_from_envelope(
+            failed_envelope(attempt_one_failed),
+            &correlations,
+        )
+        .await
+        .unwrap();
+        assert!(
+            late.is_none(),
+            "a failure of attempt 1 must not fail attempt 2"
+        );
+
+        let attempt_two_failed = send_record(&hash, PaymentStatus::Failed, 103);
+        let current = LdkServerBackend::event_from_envelope(
+            failed_envelope(attempt_two_failed),
+            &correlations,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            current,
+            Some(Event::PaymentFailed { quote_id: event_quote, .. }) if event_quote == quote_id
+        ));
     }
 }

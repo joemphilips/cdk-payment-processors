@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LDK payment ID.
 - An outgoing status check by payment hash reads the BOLT11 send directly
   before it scans the payment history.
+- A melt quote that is melted again after a failed attempt gets the events of
+  the new attempt. Before, the quote stayed finalized for 24 hours, so the new
+  attempt registered no context and its success event was dropped. A failure
+  event that is not newer than the stored record before the attempt belongs
+  to an earlier attempt and is dropped.
 - A BOLT11 `Bolt11Send` that fails with a server or transport error does not
   prove that nothing was dispatched: LDK Node dispatches before it stores the
   Pending record. While such a send is uncertain, a status check reports
