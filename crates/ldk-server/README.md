@@ -25,7 +25,13 @@ processor marks each BOLT11 send in the file before it dispatches the send, and
 removes the mark when the send call gives a definitive result. Thus a call that
 the mint cancels during the send keeps its mark. The processor writes the file
 atomically. When it cannot write a mark, it stops with exit code 70 before the
-send; fix the state directory (space, permissions) and start it again. It
+send; fix the state directory (space, permissions) and start it again.
+
+A status check by payment hash reports `Failed` for a hash that LDK Server
+has no record of, that has no mark, and that no running send uses. Every
+send has a mark before its dispatch, so such a payment was never sent, for
+example because LDK Server was down at the melt. The mint then returns the
+proofs instead of keeping the melt pending. It
 does not start when the file exists but cannot be read or parsed. Then check
 each payment hash in the file with `ldk-server-cli get-payment-details <hash>`.
 When each one has a Succeeded record, or a Failed record newer than the

@@ -122,6 +122,51 @@ impl OutgoingPaymentCorrelator {
 
 type OutgoingPaymentCorrelations = OutgoingPaymentCorrelator;
 
+/// The BOLT11 sends that run in `make_payment` now, by lowercase hash.
+#[derive(Clone, Default)]
+struct SendsInProgress(Arc<std::sync::Mutex<HashMap<String, usize>>>);
+
+impl SendsInProgress {
+    fn start(&self, hash: &str) -> SendInProgress {
+        let hash = hash.to_ascii_lowercase();
+        *self
+            .0
+            .lock()
+            .expect("send set lock")
+            .entry(hash.clone())
+            .or_default() += 1;
+        SendInProgress {
+            sends: self.clone(),
+            hash,
+        }
+    }
+
+    fn is_running(&self, hash: &str) -> bool {
+        self.0
+            .lock()
+            .expect("send set lock")
+            .contains_key(&hash.to_ascii_lowercase())
+    }
+}
+
+/// Removes its send from the set when `make_payment` ends or is cancelled.
+struct SendInProgress {
+    sends: SendsInProgress,
+    hash: String,
+}
+
+impl Drop for SendInProgress {
+    fn drop(&mut self) {
+        let mut sends = self.sends.0.lock().expect("send set lock");
+        if let Some(count) = sends.get_mut(&self.hash) {
+            *count -= 1;
+            if *count == 0 {
+                sends.remove(&self.hash);
+            }
+        }
+    }
+}
+
 /// True when a failed `Bolt11Send` does not prove that nothing was dispatched.
 ///
 /// `prior` is the stored record before the send.
@@ -340,6 +385,7 @@ pub struct LdkServerBackend {
     outgoing_payment_correlations: OutgoingPaymentCorrelations,
     uncertain_sends: Arc<Mutex<UncertainSends>>,
     on_state_write_failure: fn(String) -> !,
+    sends_in_progress: SendsInProgress,
     max_payment_scan_pages: u16,
     advertised_methods: Vec<AdvertisedMethod>,
 }
@@ -423,17 +469,24 @@ impl LdkServerBackend {
             outgoing_payment_correlations: OutgoingPaymentCorrelator::new(),
             uncertain_sends: Arc::new(Mutex::new(uncertain_sends)),
             on_state_write_failure: exit_on_state_write_failure,
+            sends_in_progress: SendsInProgress::default(),
             max_payment_scan_pages,
             advertised_methods,
         }
     }
 
     /// Reports a stored BOLT11 send, or `Unknown` while it can be stale.
+    ///
+    /// With `missing_is_failed`, a hash without a record, without a mark and
+    /// without a running send was never dispatched: every send of this
+    /// processor has a mark before its dispatch. That definite result lets the
+    /// mint release the proofs of a melt that the node never sent.
     async fn reported_bolt11_send(
         &self,
         hash: &str,
         payment: Option<Payment>,
         payment_identifier: &PaymentIdentifier,
+        missing_is_failed: bool,
     ) -> Result<MakePaymentResponse, payment::Error> {
         let verdict =
             self.uncertain_sends
@@ -453,6 +506,21 @@ impl LdkServerBackend {
                 payment_identifier.clone(),
                 &payment,
             ),
+            (SendVerdict::Record, None) if missing_is_failed => {
+                if self.sends_in_progress.is_running(hash) {
+                    return Ok(unknown_payment_response(payment_identifier));
+                }
+                tracing::info!(
+                    "BOLT11 send {} has no record and no mark: it was never sent",
+                    hash
+                );
+                Ok(MakePaymentResponse {
+                    payment_lookup_id: payment_identifier.clone(),
+                    payment_proof: None,
+                    status: MeltQuoteState::Failed,
+                    total_spent: Amount::new(0, CurrencyUnit::Msat),
+                })
+            }
             (SendVerdict::Record, None) => Err(Error::PaymentNotFound.into()),
         }
     }
@@ -795,6 +863,9 @@ impl MintPayment for LdkServerBackend {
                     route_parameters_from_max_fee(bolt11_options.max_fee_amount.clone())?;
                 let payment_hash =
                     hex::encode(bolt11_options.bolt11.payment_hash().as_byte_array());
+                // Until a mark exists, a status check must not take the missing
+                // record as proof that nothing was sent.
+                let _in_progress = self.sends_in_progress.start(&payment_hash);
                 // The record before the send: a later Failed record is current
                 // only when it is newer. LDK Node uses the hash as payment ID.
                 let prior = self.get_payment_details(&payment_hash).await?;
@@ -1174,7 +1245,7 @@ impl MintPayment for LdkServerBackend {
 
                 match (bolt11_hash, payment) {
                     (Some(hash), payment) => {
-                        self.reported_bolt11_send(&hash, payment, payment_identifier)
+                        self.reported_bolt11_send(&hash, payment, payment_identifier, false)
                             .await
                     }
                     (None, Some(payment)) => Self::make_payment_response_from_payment(
@@ -1204,7 +1275,7 @@ impl MintPayment for LdkServerBackend {
                     ),
                 };
 
-                self.reported_bolt11_send(&hash, payment, payment_identifier)
+                self.reported_bolt11_send(&hash, payment, payment_identifier, true)
                     .await
             }
             _ => Ok(unknown_payment_response(payment_identifier)),
@@ -2253,6 +2324,8 @@ mod fake_server_tests {
         /// A file whose content the fake keeps at each `Bolt11Send`.
         observed_file: Option<std::path::PathBuf>,
         observed_at_send: Vec<String>,
+        /// The next `GetPaymentDetails` signals the first and waits for the second.
+        hold_next_details: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     #[derive(Default)]
@@ -2356,6 +2429,11 @@ mod fake_server_tests {
             &self,
             request: GetPaymentDetailsRequest,
         ) -> Result<GetPaymentDetailsResponse, LdkServerError> {
+            let hold = self.state.lock().unwrap().hold_next_details.take();
+            if let Some((entered, release)) = hold {
+                entered.notify_one();
+                release.notified().await;
+            }
             let state = self.state.lock().unwrap();
             let payment = state
                 .payments
@@ -2696,10 +2774,13 @@ mod fake_server_tests {
         let hash = hash_hex(6_000_004);
         let server = FakeLdkServer::with_payments(vec![]);
         let backend = backend(server, 32);
-        assert!(backend
+        // A hash that the node never stored and that has no mark was never sent.
+        let never_sent = backend
             .check_outgoing_payment(&PaymentIdentifier::PaymentHash(hash_bytes(&hash)))
             .await
-            .is_err());
+            .expect("a hash that was never sent has a definite result");
+        assert_eq!(never_sent.status, MeltQuoteState::Failed);
+        assert_eq!(never_sent.total_spent, Amount::new(0, CurrencyUnit::Msat));
         backend
             .uncertain_sends
             .lock()
@@ -3162,5 +3243,46 @@ mod fake_server_tests {
             1,
             "the node must not get the send"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hash_whose_send_has_not_reached_the_node_is_unknown() {
+        let hash = hash_hex(6_000_014);
+        let server = FakeLdkServer::with_payments(vec![]);
+        let backend = Arc::new(backend(server.clone(), 32));
+        let (entered, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        server.state.lock().unwrap().hold_next_details = Some((entered.clone(), release.clone()));
+        server.script_send(FakeSend::Stores(Box::new(send_record(
+            &hash,
+            PaymentStatus::Pending,
+            101,
+        ))));
+
+        let sending = tokio::spawn({
+            let backend = backend.clone();
+            let hash = hash.clone();
+            async move {
+                backend
+                    .make_payment(&CurrencyUnit::Msat, send_options(&hash, &QuoteId::new()))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("make_payment reads the record before the send");
+
+        // The node has no record and no mark exists yet, but the send runs.
+        let during = backend
+            .check_outgoing_payment(&PaymentIdentifier::PaymentHash(hash_bytes(&hash)))
+            .await
+            .expect("the check answers");
+        release.notify_one();
+        let started = sending.await.unwrap().expect("the send starts");
+
+        assert_eq!(during.status, MeltQuoteState::Unknown);
+        assert_eq!(started.status, MeltQuoteState::Pending);
     }
 }

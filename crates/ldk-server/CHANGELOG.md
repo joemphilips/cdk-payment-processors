@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the send. The matched LDK Node texts come from
   `ldk_server_grpc::node_error_messages`, which an LDK Server test compares
   with LDK Node.
+- An outgoing status check by payment hash reports `Failed` for a hash with
+  no record, no mark and no running send. Before, it returned "Payment not
+  found", and the mint kept a melt that LDK Server never got pending without
+  end.
 - An incoming status check by payment hash ends at the newest match. A scan
   that reaches `ldk.max_payment_scan_pages` returns the matches that it found
   and fails only when it found none. Before, a node with more than 1,600
