@@ -2121,7 +2121,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-client"
 version = "0.1.0"
-source = "git+https://github.com/joemphilips/ldk-server?rev=70af0c50cb25b3ae33ac2793ff69a4a0cb95d8e1#70af0c50cb25b3ae33ac2793ff69a4a0cb95d8e1"
+source = "git+https://github.com/joemphilips/ldk-server?rev=267517f2c1fefd112cce25598f2819431b6ecb2f#267517f2c1fefd112cce25598f2819431b6ecb2f"
 dependencies = [
  "hyper",
  "ldk-server-grpc",
@@ -2133,7 +2133,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-grpc"
 version = "0.1.0"
-source = "git+https://github.com/joemphilips/ldk-server?rev=70af0c50cb25b3ae33ac2793ff69a4a0cb95d8e1#70af0c50cb25b3ae33ac2793ff69a4a0cb95d8e1"
+source = "git+https://github.com/joemphilips/ldk-server?rev=267517f2c1fefd112cce25598f2819431b6ecb2f#267517f2c1fefd112cce25598f2819431b6ecb2f"
 dependencies = [
  "bytes",
  "http",
@@ -2146,7 +2146,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-macaroons"
 version = "0.1.0"
-source = "git+https://github.com/joemphilips/ldk-server?rev=70af0c50cb25b3ae33ac2793ff69a4a0cb95d8e1#70af0c50cb25b3ae33ac2793ff69a4a0cb95d8e1"
+source = "git+https://github.com/joemphilips/ldk-server?rev=267517f2c1fefd112cce25598f2819431b6ecb2f#267517f2c1fefd112cce25598f2819431b6ecb2f"
 dependencies = [
  "bitcoin_hashes 0.14.101",
  "hex-conservative 0.2.2",
