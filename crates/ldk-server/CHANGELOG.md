@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It is mutually exclusive with `ldk.macaroon`. The debug output and the
   serialized configuration no longer contain the macaroon.
 - bitCaster fork only: a `[patch.crates-io]` section builds the crate against
-  the bitCaster CDK fork `d8bab862`. Remove it before an upstream pull request.
+  the bitCaster CDK fork `f6d003e5`. Remove it before an upstream pull request.
   It also replaces `libsqlite3-sys`, which only the test builds link, with the
   copy that has the SQLite WAL correction.
 - The release build has `panic = "abort"`. A panic ends the process, so that no
@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated LDK Server to a revision where `payments:send` permits `Bolt11Send`
   and `Bolt12Send` only, and where LDK Server creates no mnemonic. The regtest
   suite writes the mnemonic of each node before its start.
-- Updated LDK Server to `7bcba51`. The client and the protocol do not change.
+- Updated LDK Server to `f16b3bf`, which sets `TCP_NODELAY` on its gRPC
+  connections. The client and the protocol do not change.
 - Updated locked dependencies to releases with security fixes: `rustls`
   0.23.46, `rustls-webpki` 0.103.16, `tokio` 1.53.3, `url` 2.5.9 with
   `form_urlencoded` 1.2.3, and `webpki-roots` 1.0.10.
@@ -38,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The gRPC server ends the event task of a mint that closed its event stream.
   Before, each reconnect of the mint left one task, and such a task took events
   of the later streams. The server also waits before each new open of the
-  backend event stream. Both come from the CDK fork `d8bab862`.
+  backend event stream. Both come from the CDK fork `f6d003e5`.
 - BOLT11 `make_payment` results and outgoing success events now report the
   invoice payment hash, the lookup ID of the BOLT11 melt quote, instead of the
   LDK payment ID. A mint that requires the lookup ID of the quote no longer

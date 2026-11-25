@@ -17,8 +17,8 @@ mod tests {
         assert!(
             packages[0].contains(
                 "source = \"git+https://github.com/joemphilips/cdk?\
-                 rev=d8bab862eceff1e9355c6079f1131674637fc450#\
-                 d8bab862eceff1e9355c6079f1131674637fc450\""
+                 rev=f6d003e553d50e241b335e97afce05e1643dada5#\
+                 f6d003e553d50e241b335e97afce05e1643dada5\""
             ),
             "{}",
             packages[0]
