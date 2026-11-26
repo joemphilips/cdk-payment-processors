@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # ldk-server deps
 
 bitcoin = { version = "0.32.2", features = ["base64", "serde", "rand", "rand-std"] }
-ldk-server-client = { git = "https://github.com/joemphilips/ldk-server", rev = "abe066ff3fe75b2e218706c77218c8a7b9629590", default-features = false }
+ldk-server-client = { git = "https://github.com/joemphilips/ldk-server", rev = "38807b87c26910d0034098af0175ebb9db03ae15", default-features = false }
 lightning = { version = "0.2.0", default-features = false, features = ["std"] }
 tokio-util = "0.7"
 
@@ -61,15 +61,15 @@ required-features = ["regtest-tests"]
 # processor speaks to the cdk-mintd of that fork. Remove this section before an
 # upstream pull request.
 [patch.crates-io]
-cashu = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
-cdk = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
-cdk-axum = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
-cdk-common = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
-cdk-http-client = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
-cdk-payment-processor = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
-cdk-signatory = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
-cdk-sql-common = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
-cdk-sqlite = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
+cashu = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }
+cdk = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }
+cdk-axum = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }
+cdk-common = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }
+cdk-http-client = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }
+cdk-payment-processor = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }
+cdk-signatory = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }
+cdk-sql-common = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }
+cdk-sqlite = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }
 # The SQLite WAL correction of that fork (RUSTSEC-2026-0459). Only the test
 # builds (`regtest-tests`) link SQLite.
-libsqlite3-sys = { git = "https://github.com/joemphilips/cdk", rev = "f6d003e553d50e241b335e97afce05e1643dada5" }
+libsqlite3-sys = { git = "https://github.com/joemphilips/cdk", rev = "1fb21ebcb1c48965b08e2a595651b2f88e3f2e89" }

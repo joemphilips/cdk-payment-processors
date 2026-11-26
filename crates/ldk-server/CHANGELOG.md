@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It is mutually exclusive with `ldk.macaroon`. The debug output and the
   serialized configuration no longer contain the macaroon.
 - bitCaster fork only: a `[patch.crates-io]` section builds the crate against
-  the bitCaster CDK fork `f6d003e5`. Remove it before an upstream pull request.
+  the bitCaster CDK fork `1fb21ebc`. Remove it before an upstream pull request.
   It also replaces `libsqlite3-sys`, which only the test builds link, with the
   copy that has the SQLite WAL correction.
 - The release build has `panic = "abort"`. A panic ends the process, so that no
@@ -28,9 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated LDK Server to a revision where `payments:send` permits `Bolt11Send`
   and `Bolt12Send` only, and where LDK Server creates no mnemonic. The regtest
   suite writes the mnemonic of each node before its start.
-- Updated LDK Server to `abe066f`. It sets `TCP_NODELAY` on its gRPC
-  connections, and its node refuses each splice that a counterparty starts. The
-  client and the protocol do not change.
+- Updated LDK Server to `38807b8`. It sets `TCP_NODELAY` on its gRPC
+  connections, its node refuses each splice that a counterparty starts, and it
+  locks `url` 2.5.9. The client and the protocol do not change.
 - Updated locked dependencies to releases with security fixes: `rustls`
   0.23.46, `rustls-webpki` 0.103.16, `tokio` 1.53.3, `url` 2.5.9 with
   `form_urlencoded` 1.2.3, and `webpki-roots` 1.0.10.
