@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Repinned the CDK fork to `8fb4fbf1` and LDK Server client/regtest daemon to
+  `6e132c91`. The processor keeps its existing payment permissions and configuration.
+
 - Updated all CDK dependencies from `0.18.1` to `0.18.2`.
 - Ported the backend to LDK Server `d7e7a2e`: macaroon authentication replaces
   the HMAC API key (`ldk.macaroon` / `LDK_MACAROON` replaces `ldk.api_key` /
@@ -19,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It is mutually exclusive with `ldk.macaroon`. The debug output and the
   serialized configuration no longer contain the macaroon.
 - bitCaster fork only: a `[patch.crates-io]` section builds the crate against
-  the bitCaster CDK fork `1fb21ebc`. Remove it before an upstream pull request.
+  the bitCaster CDK fork `8fb4fbf1`. Remove it before an upstream pull request.
   It also replaces `libsqlite3-sys`, which only the test builds link, with the
   copy that has the SQLite WAL correction.
 - The release build has `panic = "abort"`. A panic ends the process, so that no
